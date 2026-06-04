@@ -26,6 +26,13 @@ serve(async (req) => {
         CURRENT_WAREHOUSE() as current_warehouse
     `;
 
+    const key = Deno.env.get("SNOWFLAKE_PRIMARY_PRIVATE_KEY") ?? "";
+    console.log("PRIVATE_KEY length:", key.length);
+    console.log("has BEGIN:", key.includes("-----BEGIN"));
+    console.log("has END:", key.includes("-----END"));
+    console.log("has ENCRYPTED PRIVATE KEY:", key.includes("ENCRYPTED PRIVATE KEY"));
+
+
     // Führt die Abfrage auf der 'primary' Instanz aus
     const result = await executeSnowflakeQuery('primary', sqlQuery);
 

@@ -5,14 +5,13 @@ import {
   type KeyObject,
 } from "node:crypto";
 import { importPKCS8, SignJWT } from "npm:jose@5.9.6";
-import forge from "npm:node-forge@1.3.1";
-
 import type { SnowflakeInstanceConfig } from "./types.ts";
 
 const MAX_LIFETIME_SECONDS = 3600;
 const CACHE_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 
 type JwtCacheEntry = { token: string; expiresAtMs: number };
+
 const jwtCache = new Map<string, JwtCacheEntry>();
 
 /**
@@ -36,32 +35,11 @@ export function normalizePem(pem: string): string {
   if (!s.includes("-----BEGIN") || !s.includes("-----END")) {
     throw new Error(
       "SNOWFLAKE_*_PRIVATE_KEY is incomplete (missing -----BEGIN or -----END). " +
-        "Env files cannot hold multiline PEM unless it is one line with literal \\n between lines.",
+        "Env files cannot hold multiline PEM unless it is one line with literal \\n between lines. " +
+        "See supabase/.secrets/README.md",
     );
   }
   return s;
-}
-
-function decryptEncryptedPkcs8ToPkcs8Pem(encryptedPem: string, passphrase: string): string {
-  const pw = passphrase.trim();
-  if (!pw) throw new Error("Empty passphrase");
-
-  try {
-    // PKCS#8 "BEGIN ENCRYPTED PRIVATE KEY" -> EncryptedPrivateKeyInfo (ASN.1)
-    const encryptedInfo = forge.pki.encryptedPrivateKeyFromPem(encryptedPem);
-
-    // Decrypt -> PrivateKeyInfo (ASN.1)
-    const privateKeyInfo = forge.pki.decryptPrivateKeyInfo(encryptedInfo, pw);
-    if (!privateKeyInfo) {
-      throw new Error("decryptPrivateKeyInfo returned null (wrong passphrase?)");
-    }
-
-    // PrivateKeyInfo -> PKCS#8 PEM ("BEGIN PRIVATE KEY")
-    return forge.pki.privateKeyInfoToPem(privateKeyInfo);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`node-forge could not decrypt PKCS#8 key: ${msg}`);
-  }
 }
 
 /** Snowflake JWT `sub`: `ACCOUNT.USER` (uppercased). */
@@ -112,10 +90,9 @@ export async function mintSnowflakeJwt(
     options.lifetimeSeconds ?? MAX_LIFETIME_SECONDS,
     MAX_LIFETIME_SECONDS,
   );
-
-  const pemOriginal = normalizePem(options.privateKeyPem);
-  const encrypted = pemOriginal.includes("ENCRYPTED PRIVATE KEY");
-  const passphrase = options.privateKeyPassphrase?.trim();
+  const pem = normalizePem(options.privateKeyPem);
+  const encrypted = pem.includes("ENCRYPTED");
+  const passphrase = options.privateKeyPassphrase?.trim() || undefined;
 
   if (encrypted && !passphrase) {
     throw new Error(
@@ -123,47 +100,27 @@ export async function mintSnowflakeJwt(
     );
   }
 
-  // 1) Load private key (node:crypto first, fallback to forge decrypt -> node:crypto)
-  let keyObject: KeyObject;
-
-  if (!encrypted) {
-    // Unencrypted PKCS#8
-    try {
-      keyObject = createPrivateKey({ key: pemOriginal, format: "pem" });
-    } catch (e) {
-      const detail = e instanceof Error ? e.message : String(e);
-      throw new Error(`Could not load PEM private key: ${detail}`);
+  let keyObject;
+  try {
+    keyObject = createPrivateKey({
+      key: pem,
+      format: "pem",
+      passphrase: encrypted ? passphrase : undefined,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (detail.toLowerCase().includes("encrypted") || detail.toLowerCase().includes("decrypt")) {
+      throw new Error(
+        "Could not load encrypted PEM private key: use a single-line SNOWFLAKE_*_PRIVATE_KEY with \\n " +
+          "between lines, and verify PRIVATE_KEY_PASSPHRASE.",
+      );
     }
-  } else {
-    // Encrypted PKCS#8
-    try {
-      keyObject = createPrivateKey({
-        key: pemOriginal,
-        format: "pem",
-        passphrase,
-      });
-    } catch {
-      // Fallback: decrypt with forge (in-memory) then load unencrypted key
-      const decryptedPem = decryptEncryptedPkcs8ToPkcs8Pem(pemOriginal, passphrase!);
-      try {
-        keyObject = createPrivateKey({
-          key: decryptedPem,
-          format: "pem",
-          // decrypted key must NOT use passphrase
-        });
-      } catch (e) {
-        const detail = e instanceof Error ? e.message : String(e);
-        throw new Error(`Could not load decrypted PEM private key: ${detail}`);
-      }
-    }
+    throw new Error(`Could not load PEM private key: ${detail}`);
   }
-
-  // 2) Build Snowflake JWT claims
   const subject = snowflakeJwtSubject(options.account, options.user);
   const fingerprint = publicKeyFingerprintFromPrivateKey(keyObject);
   const issuer = snowflakeJwtIssuer(options.account, options.user, fingerprint);
 
-  // 3) Sign JWT
   const pkcs8 = keyObject.export({ format: "pem", type: "pkcs8" }) as string;
   const signingKey = await importPKCS8(pkcs8, "RS256");
 
@@ -186,7 +143,6 @@ export async function getSnowflakeJwt(config: SnowflakeInstanceConfig): Promise<
     .digest("base64url")
     .slice(0, 16);
   const cacheKey = `${subject}:${pemHash}`;
-
   const cached = jwtCache.get(cacheKey);
   const nowMs = Date.now();
   if (cached && cached.expiresAtMs > nowMs + CACHE_REFRESH_BUFFER_MS) {
