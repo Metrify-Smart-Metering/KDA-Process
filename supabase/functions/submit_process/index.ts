@@ -22,18 +22,16 @@ Deno.serve(async (req) => {
 
   try {
     // 2. Request-Parameter auslesen
-    // Wir erwarten die Zählerstände und die Pfade der hochgeladenen Bilder (falls hochgeladen)
-    const { 
-      process_id, 
-      token, 
-      cons_val, 
-      prod_val, 
-      cons_file_path, // z.B. "42/1.8.0.jpg" (aus create_upload_url erhalten)
-      prod_file_path  // z.B. "42/2.8.0.jpg" (optional)
+    const {
+      process_id,
+      token,
+      cons_val,
+      prod_val,
+      cons_file_path,
+      prod_file_path
     } = await req.json()
 
     // 3. Pflichtfelder validieren
-    // cons_val (Bezug) ist Pflicht. prod_val (Einspeisung) ist optional.
     if (!process_id || !token || cons_val === undefined || cons_val === null) {
       return new Response(
         JSON.stringify({ error: 'Fehlende Pflichtfelder (process_id, token oder cons_val).' }),
@@ -43,10 +41,11 @@ Deno.serve(async (req) => {
 
     // 4. Supabase-Client mit Secret-Key initialisieren (RLS-Bypass)
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') 
-      ?? Deno.env.get('SUPABASE_SECRET_KEY') 
+    const supabaseSecretKey =
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
+      ?? Deno.env.get('SUPABASE_SECRET_KEY')
       ?? ''
-    
+
     const supabase = createClient(supabaseUrl, supabaseSecretKey)
 
     // 5. Token hashen und in "access_tokens" prüfen
@@ -74,10 +73,10 @@ Deno.serve(async (req) => {
       )
     }
 
-    // 6. Prüfen, ob der Prozess in "Process_Database" bereits finalisiert wurde
+    // 6. Prüfen, ob der Prozess bereits finalisiert/eingereicht wurde
     const { data: processData, error: processError } = await supabase
       .from('Process_Database')
-      .select('kda_status')
+      .select('kda_status, submitted_at')
       .eq('id', process_id)
       .single()
 
@@ -88,8 +87,7 @@ Deno.serve(async (req) => {
       )
     }
 
-    // Wenn der Status bereits 4 oder höher ist (Werte liegen vor / eingereicht)
-    if (processData.kda_status >= 4) {
+    if (processData.kda_status >= 4 || processData.submitted_at !== null) {
       return new Response(
         JSON.stringify({ error: 'Für diesen Fall wurden bereits Werte eingereicht.' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -104,7 +102,7 @@ Deno.serve(async (req) => {
         process_id: process_id,
         storage_path: cons_file_path,
         file_type: 'image',
-        obis_code: '1.8.0' // Bezugsbild
+        obis_code: '1.8.0'
       })
     }
 
@@ -113,11 +111,10 @@ Deno.serve(async (req) => {
         process_id: process_id,
         storage_path: prod_file_path,
         file_type: 'image',
-        obis_code: '2.8.0' // Einspeisungsbild
+        obis_code: '2.8.0'
       })
     }
 
-    // Wenn Bilder vorhanden sind, in die Datenbank schreiben
     if (filesToInsert.length > 0) {
       const { error: fileError } = await supabase
         .from('submission_files')
@@ -132,13 +129,17 @@ Deno.serve(async (req) => {
     }
 
     // 8. Haupttabelle "Process_Database" aktualisieren
-    // Wir tragen die Werte ein und setzen den Status auf 4 (Preliminary Values)
+    const submittedAt = new Date().toISOString()
+
     const { error: updateError } = await supabase
       .from('Process_Database')
       .update({
         cons_val: parseFloat(cons_val),
-        prod_val: prod_val ? parseFloat(prod_val) : null,
-        kda_status: 4, // Status: Preliminary Values
+        prod_val: prod_val !== undefined && prod_val !== null && prod_val !== ''
+          ? parseFloat(prod_val)
+          : null,
+        kda_status: 4,
+        submitted_at: submittedAt,
       })
       .eq('id', process_id)
 
@@ -149,24 +150,21 @@ Deno.serve(async (req) => {
       )
     }
 
-    // 9. Token entwerten (One-Time-Sicherheit!)
-    // Wir setzen "used_at" auf das aktuelle Datum. Damit ist der Link ab sofort tot.
+    // 9. Token entwerten (One-Time-Sicherheit)
     const { error: tokenUseError } = await supabase
       .from('access_tokens')
-      .update({ used_at: new Date().toISOString() })
+      .update({ used_at: submittedAt })
       .eq('token_hash', hashedToken)
 
     if (tokenUseError) {
-      // Das ist ein kritischer Fehler (Werte gespeichert, aber Token nicht entwertet).
-      // Wir loggen das für die Administratoren.
       console.error(`Kritisch: Token ${tokenData.id} konnte nicht entwertet werden!`, tokenUseError)
     }
 
     // 10. Erfolgsantwort
     return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: 'Zählerstände und Bilder wurden erfolgreich übermittelt.' 
+      JSON.stringify({
+        success: true,
+        message: 'Zählerstände und Bilder wurden erfolgreich übermittelt.'
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )
