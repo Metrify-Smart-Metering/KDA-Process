@@ -93,8 +93,8 @@ Deno.serve(async (req) => {
         id,
         customer_label,
         execution_date,
-        last_cons_val,
-        last_prod_val,
+        last_cons_reading,
+        last_prod_reading,
         reading_date,
         customer_pii_id,
         Customer_PII (
@@ -137,8 +137,8 @@ Deno.serve(async (req) => {
           },
           execution_date: processData.execution_date,
           reading_date: processData.reading_date,
-          last_cons_val: processData.last_cons_val ?? null,
-          last_prod_val: processData.last_prod_val ?? null,
+          last_cons_reading: processData.last_cons_reading ?? null,
+          last_prod_reading: processData.last_prod_reading ?? null,
           meter_number: pii?.meter_number ?? null
         }
       }),
