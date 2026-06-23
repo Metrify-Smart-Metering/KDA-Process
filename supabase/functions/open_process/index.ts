@@ -28,9 +28,9 @@ Deno.serve(async (req) => {
 
   try {
     // 2. Request-Daten auslesen
-    const { process_id, token } = await req.json()
+    const { process_id, token, customer_plz } = await req.json()
 
-    if (!process_id || !token) {
+    if (!process_id || !token || !customer_plz) {
       return new Response(
         JSON.stringify({ error: 'Prozess-ID und Token sind erforderlich.' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -102,7 +102,8 @@ Deno.serve(async (req) => {
           customer_l_name,
           customer_salutation,
           melo,
-          meter_number
+          meter_number,
+          customer_plz
         )
       `)
       .eq('id', process_id)
@@ -118,6 +119,15 @@ Deno.serve(async (req) => {
     // Falls die PII bereits gelöscht wurde (z.B. nach Fertigstellung), 
     // ist das relationale Objekt 'Customer_PII' null. Wir fangen das ab.
     const pii = processData.Customer_PII;
+    const normalizedInputPlz = String(customer_plz).trim()
+    const normalizedStoredPlz = String(pii?.customer_plz ?? '').trim()
+
+    if (!normalizedStoredPlz || normalizedInputPlz !== normalizedStoredPlz) {
+      return new Response(
+        JSON.stringify({ error: 'Die eingegebene Postleitzahl ist ungueltig.' }),
+        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
 
     // 8. Erfolgreiche Antwort zurückgeben
     // Wir bauen das Objekt so zusammen, dass die Struktur exakt der alten entspricht!

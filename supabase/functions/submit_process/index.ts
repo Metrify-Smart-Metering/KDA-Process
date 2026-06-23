@@ -260,12 +260,15 @@ Deno.serve(async (req) => {
       prod_val, 
       cons_file_path,
       prod_file_path,
-      reading_date
+      reading_date,
+      customer_plz
     } = await req.json()
 
 
+
     // 3. Pflichtfelder validieren
-    if (!process_id || !token || cons_val === undefined || cons_val === null || !reading_date) {
+    if (!process_id || !token || !customer_plz || cons_val === undefined || cons_val === null || !reading_date) {
+
       return new Response(
         JSON.stringify({ error: 'Fehlende Pflichtfelder (process_id, token, cons_val oder reading_date).' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -349,7 +352,10 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
         kda_status,
         submitted_at,
         customer_label,
-        customer_pii_id
+        customer_pii_id,
+        Customer_PII (
+          customer_plz
+        )
       `)
       .eq('id', process_id)
       .single()
@@ -360,6 +366,16 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
+    const storedPlz = String(processData.Customer_PII?.customer_plz ?? '').trim()
+    const inputPlz = String(customer_plz).trim()
+
+    if (!storedPlz || storedPlz !== inputPlz) {
+      return new Response(
+        JSON.stringify({ error: 'Die eingegebene Postleitzahl ist ungueltig.' }),
+        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
 
     if (processData.kda_status >= 4 || processData.submitted_at !== null) {
       return new Response(

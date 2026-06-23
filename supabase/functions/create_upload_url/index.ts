@@ -23,9 +23,10 @@ Deno.serve(async (req) => {
   try {
     // 2. Request-Parameter auslesen
     // Wir erwarten den Dateinamen (um die Endung wie .jpg/.png zu bestimmen)
-    const { process_id, token, obis_code, filename } = await req.json()
+    const { process_id, token, customer_plz, obis_code, filename } = await req.json()
 
-    if (!process_id || !token || !obis_code || !filename) {
+
+    if (!process_id || !token || !customer_plz || !obis_code || !filename) {
       return new Response(
         JSON.stringify({ error: 'Fehlende Pflichtfelder (process_id, token, obis_code, filename).' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -76,14 +77,31 @@ Deno.serve(async (req) => {
     // 6. Prüfen, ob der Prozess in "Process_Database" bereits abgesendet wurde
     const { data: processData, error: processError } = await supabase
       .from('Process_Database')
-      .select('submitted_at')
+      .select(`
+        submitted_at,
+        customer_pii_id,
+        Customer_PII (
+          customer_plz
+        )
+      `)
       .eq('id', process_id)
       .single()
+
 
     if (processError || !processData) {
       return new Response(
         JSON.stringify({ error: 'Prozess nicht gefunden.' }),
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
+    const storedPlz = String(processData.Customer_PII?.customer_plz ?? '').trim()
+    const inputPlz = String(customer_plz).trim()
+
+    if (!storedPlz || storedPlz !== inputPlz) {
+      return new Response(
+        JSON.stringify({ error: 'Die eingegebene Postleitzahl ist ungueltig.' }),
+        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
@@ -94,6 +112,9 @@ Deno.serve(async (req) => {
       )
     }
 
+
+
+
     // 7. Sicheren Upload-Pfad generieren
     // Wir extrahieren die Dateiendung (z.B. .jpg oder .png) aus dem Originaldateinamen
     const fileExtension = filename.split('.').pop()?.toLowerCase() || 'jpg'
@@ -101,6 +122,7 @@ Deno.serve(async (req) => {
     // Speicherpfad im Bucket: z.B. "submissions/42/1.8.0.jpg"
     // Das überschreibt automatisch ältere Versuche für denselben Zähler dieses Falls.
     const storagePath = `${process_id}/${obis_code}.${fileExtension}`
+
 
     // 8. Signierte Upload-URL von Supabase Storage anfordern
     // Wir nutzen einen privaten Bucket namens "meter-readings_pics"
