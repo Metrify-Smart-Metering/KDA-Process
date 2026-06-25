@@ -494,3 +494,25 @@ entrypoint = "./functions/Get_Trigger_Data/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/Get_Trigger_Data/*.html" ]
+
+[functions.Select_KDA_Process_From_Trigger]
+enabled = true
+verify_jwt = false
+import_map = "./functions/Select_KDA_Process_From_Trigger/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/Select_KDA_Process_From_Trigger/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/Select_KDA_Process_From_Trigger/*.html" ]
+
+[functions.insert_new_process]
+enabled = true
+verify_jwt = false
+import_map = "./functions/insert_new_process/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/insert_new_process/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/insert_new_process/*.html" ]

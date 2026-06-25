@@ -200,7 +200,7 @@ Deno.serve(async (req) => {
           const orgExeDateIso = parseSnowflakeDate(rawOrgExeDate);
 
                     
-          // CRITICAL FIX: Da Last_True_Val in Postgres ein DATE Feld ist, müssen wir es ebenfalls mit parseSnowflakeDate behandeln!
+          // CRITICAL FIX: Da last_true_val in Postgres ein DATE Feld ist, müssen wir es ebenfalls mit parseSnowflakeDate behandeln!
           const lastTrueValIso = parseSnowflakeDate(rawLastTrueVal);
 
 
@@ -221,7 +221,7 @@ Deno.serve(async (req) => {
           rawCandidates.push({
             Melo: melo,
             Org_Exe_Date: orgExeDateIso,
-            Last_True_Val: lastTrueValIso, // Nun sauber formatiertes Datum (z. B. "2024-01-03") oder null
+            last_true_val: lastTrueValIso, // Nun sauber formatiertes Datum (z. B. "2024-01-03") oder null
             Trigger_Type: triggerId,
             Priority: Number(config.priority ?? 999)
           });
@@ -266,7 +266,7 @@ Deno.serve(async (req) => {
 
       // REGEL 6: "Falls einer der beiden Status declined oder accepted, muss der stehen bleiben."
       const finalizedRecord = existing.find(r => 
-        ['accepted', 'declined'].includes(String(r.Trigger_Status).toLowerCase())
+        ['accepted', 'rejected'].includes(String(r.Trigger_Status).toLowerCase())
       );
 
       if (finalizedRecord) {
@@ -282,7 +282,7 @@ Deno.serve(async (req) => {
           isExisting: true,
           Melo: r.Melo,
           Org_Exe_Date: r.Org_Exe_Date,
-          Last_True_Val: r.Last_True_Val,
+          last_true_val: r.last_true_val,
           Trigger_Type: r.Trigger_Type,
           Trigger_Status: r.Trigger_Status,
           Priority: Number(configs.find(c => c.id === r.Trigger_Type)?.priority ?? 999)
@@ -292,7 +292,7 @@ Deno.serve(async (req) => {
           isExisting: false,
           Melo: c.Melo,
           Org_Exe_Date: c.Org_Exe_Date,
-          Last_True_Val: c.Last_True_Val,
+          last_true_val: c.last_true_val,
           Trigger_Type: c.Trigger_Type,
           Trigger_Status: 'initial',
           Priority: c.Priority
@@ -326,7 +326,7 @@ Deno.serve(async (req) => {
         inserts.push({
           Melo: winner.Melo,
           Org_Exe_Date: winner.Org_Exe_Date,
-          Last_True_Val: winner.Last_True_Val,
+          last_true_val: winner.last_true_val,
           Trigger_Type: winner.Trigger_Type,
           Ex_Date: null,
           Added: todayIsoStr,

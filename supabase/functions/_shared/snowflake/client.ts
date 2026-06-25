@@ -64,7 +64,7 @@ export async function executeSnowflakeQuery(
     },
     body: JSON.stringify({
       statement,
-      timeout: 30,
+      timeout: 120,
       bindings,
       warehouse: config.warehouse,
       database: config.database,

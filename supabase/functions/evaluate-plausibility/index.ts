@@ -221,9 +221,9 @@ Deno.serve(async (req) => {
     const { error: updateError } = await supabase
       .from('Process_Database')
       .update({
-        kda_status: nextStatus,
-        last_cons_reading: consScore,
-        last_prod_reading: prodScore
+        kda_status: nextStatus
+        //last_cons_reading: consScore,
+        //last_prod_reading: prodScore
       })
       .eq('id', record.id);
 
