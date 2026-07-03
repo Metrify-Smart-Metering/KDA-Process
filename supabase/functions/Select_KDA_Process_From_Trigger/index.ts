@@ -1,4 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
+import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+
+const JOB_NAME = 'Select_KDA_Process_From_Trigger'
 
 // ==========================================
 // CORS HEADERS
@@ -127,18 +130,51 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders });
   }
 
+  // Supabase-Client deklarieren (damit er auch im catch-Block zur Verfügung steht)
+  let supabase: any = null;
+
   try {
     console.log("=== Select_KDA_Process_From_Trigger gestartet ===");
 
-    // 1. Supabase Client mit Service Role initialisieren (RLS-Bypass)
+    // 1. Webhook Payload sichern und auswerten
+    let payload: any = null;
+    try {
+      const reqText = await req.text();
+      if (reqText) {
+        payload = JSON.parse(reqText);
+      }
+    } catch (e) {
+      console.log("[Pipeline] Konnte Request-Body nicht als JSON parsen. Fahre ohne Webhook-Filterung fort.");
+    }
+
+    // Pipeline-Filter: Falls der Aufruf von unserem Webhook auf pipeline_control kommt
+    if (payload && payload.type === 'INSERT' && payload.table === 'pipeline_control') {
+      const jobName = payload.record?.job_name;
+      const status = payload.record?.status;
+
+      if (jobName !== 'Get_Trigger_Data' || status !== 'success') {
+        console.log(`[Pipeline] Ignoriere Event für Job '${jobName}' mit Status '${status}'.`);
+        return new Response(JSON.stringify({ message: "Ignoriert", success: true }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+          status: 200
+        });
+      }
+      console.log("[Pipeline] Webhook empfangen: Get_Trigger_Data war erfolgreich! Starte Verarbeitung...");
+    }
+
+
+    // 2. Supabase Client mit Service Role initialisieren (RLS-Bypass)
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
     const supabaseSecretKey =
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ??
       Deno.env.get('SUPABASE_SECRET_KEY') ??
       '';
-    const supabase = createClient(supabaseUrl, supabaseSecretKey);
+    supabase = createClient(supabaseUrl, supabaseSecretKey);
+    const startTime = Date.now()
+    const collector = new RunErrorCollector()
 
-    // 2. Heutiges Datum (Europe/Berlin) als ISO yyyy-mm-dd bestimmen
+
+    // 3. Heutiges Datum (Europe/Berlin) als ISO yyyy-mm-dd bestimmen
     const now = new Date();
     const fmt = new Intl.DateTimeFormat('de-DE', {
       timeZone: 'Europe/Berlin',
@@ -151,7 +187,8 @@ Deno.serve(async (req) => {
     const todayIso = `${year}-${month}-${day}`;
     console.log(`[Info] Heutiges Datum (Berlin): ${todayIso}`);
 
-    // 3. Trigger_Config laden -> Map nach id
+
+    // 4. Trigger_Config laden -> Map nach id
     console.log("[Load] Trigger_Config laden...");
     const { data: configs, error: configErr } = await supabase
       .from('Trigger_Config')
@@ -163,8 +200,8 @@ Deno.serve(async (req) => {
     for (const c of configs) configMap.set(c.id, c);
     console.log(`[Load] ${configs.length} Konfigurationen geladen.`);
 
-    // 4. Offene Backlog-Einträge laden (Nicht-Final)
-    // Bereits 'accepted', 'declined' oder 'rejected' Einträge werden hierbei komplett ignoriert
+
+    // 5. Offene Backlog-Einträge laden (Nicht-Final)
     console.log("[Load] Offene Trigger_Backlog-Einträge laden...");
     const { data: backlog, error: backlogErr } = await supabase
       .from('Trigger_Backlog')
@@ -176,7 +213,18 @@ Deno.serve(async (req) => {
     }
     console.log(`[Load] ${backlog.length} offene Backlog-Einträge gefunden.`);
 
+
     if (backlog.length === 0) {
+      // Auch wenn nichts zu tun ist, müssen wir Erfolg an pipeline_control melden, 
+      // damit die Kette für insert_new_process nicht unkontrolliert unterbrochen wird
+      console.log("[Pipeline] Keine offenen Backlog-Einträge. Melde trotzdem Erfolg an pipeline_control...");
+      await logPipelineRun(supabase, {
+        jobName: JOB_NAME,
+        status: 'success',
+        collector,
+        durationMs: Date.now() - startTime
+      })
+
       return new Response(JSON.stringify({
         success: true, message: "Keine offenen Backlog-Einträge zu verarbeiten."
       }), { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 });
@@ -188,11 +236,12 @@ Deno.serve(async (req) => {
     for (const m of rawMelos) {
       queryMelos.push(m);
       queryMelos.push(m.trim());
-      queryMelos.push(`${m.trim()} `); // Falls in der DB ein trailing space existiert
+      queryMelos.push(`${m.trim()} `);
     }
     const meloSet = Array.from(new Set(queryMelos));
 
-    // 4a. ALLE bereits existierenden accepted-Backlog-Einträge für diese Melos laden, um sie als Nachbarn für 3a zu nutzen
+
+    // 5a. ALLE bereits existierenden accepted-Backlog-Einträge für diese Melos laden
     console.log(`[Load] Lade accepted-Nachbarn für ${meloSet.length} Melo-Varianten...`);
     let acceptedRows: any[] = [];
     {
@@ -203,6 +252,7 @@ Deno.serve(async (req) => {
         .in('Melo', meloSet);
       if (accErr) {
         console.warn(`[Warn] accepted-Nachbarn konnten nicht geladen werden: ${accErr.message}`);
+        collector.warn(`accepted-Nachbarn konnten nicht geladen werden: ${accErr.message}`)
       } else {
         acceptedRows = accData ?? [];
       }
@@ -217,7 +267,8 @@ Deno.serve(async (req) => {
       acceptedByMelo.get(key)!.push(r);
     }
 
-    // 5. Laufende Prozesse aus Process_Database vorab laden und ueber Customer_PII auf Melo mappen
+
+    // 6. Laufende Prozesse aus Process_Database vorab laden
     console.log(`[Load] Process_Database via Customer_PII für ${meloSet.length} Melo-Varianten abfragen...`);
     let processRows: any[] = [];
     {
@@ -235,6 +286,7 @@ Deno.serve(async (req) => {
         .in('Customer_PII.melo', meloSet);
       if (procErr) {
         console.warn(`[Warn] Process_Database konnte nicht geladen werden: ${procErr.message}`);
+        collector.warn(`Process_Database konnte nicht geladen werden: ${procErr.message}`)
       } else {
         processRows = procData ?? [];
       }
@@ -267,7 +319,8 @@ Deno.serve(async (req) => {
     }
     console.log(`[Load] ${processRows.length} Process_Database-Zeilen geladen, ${processByMelo.size} Melos mit aktiven Prozessen gemappt.`);
 
-    // 6. Pro Backlog-Eintrag die Regeln (3a -> 3e) anwenden
+
+    // 7. Pro Backlog-Eintrag die Regeln (3a -> 3e) anwenden
     const updates: Array<{
       id: any;
       Trigger_Status: string;
@@ -308,7 +361,7 @@ Deno.serve(async (req) => {
       const melo = String(getField(rec, ['Melo', 'melo']) ?? '').trim();
 
       // -----------------------------------------------------
-      // 3a. Bereits-bedient-Check (vergangenes Org_Exe_Date + Nachbar in Lockout)
+      // 3a. Bereits-bedient-Check
       // -----------------------------------------------------
       if (orgExeDate < todayIso) {
         const neighbors = (acceptedByMelo.get(melo) ?? []).filter(other => {
@@ -403,7 +456,7 @@ Deno.serve(async (req) => {
     }
 
     // ==========================================
-    // 7. Updates in die DB schreiben
+    // 8. Updates in die DB schreiben
     // ==========================================
     console.log(`[Plan] Updates: accepted=${countAccepted}, rejected=${countRejected}, wait=${countWait}, skip=${countSkip}, invalid=${countInvalid}, total-updates=${updates.length}`);
 
@@ -426,6 +479,7 @@ Deno.serve(async (req) => {
           .eq('Trigger_Candidate_ID', u.id);
         if (error) {
           console.error(`[Update-Fehler] id=${u.id}: ${error.message}`);
+          collector.error(`Backlog-Update fehlgeschlagen: ${error.message}`, { trigger_candidate_id: u.id })
           return false;
         }
         return true;
@@ -434,6 +488,18 @@ Deno.serve(async (req) => {
     }
 
     console.log(`[Done] ${updatedCount} Updates ok, ${failedCount} fehlerhaft.`);
+
+    // ==========================================
+    // PIPELINE: ERFOLGSMELDUNG AN STEUERUNGSTABELLE
+    // ==========================================
+    console.log("[Pipeline] Melde Erfolg an pipeline_control...");
+    await logPipelineRun(supabase, {
+      jobName: JOB_NAME,
+      status: 'success',
+      collector,
+      durationMs: Date.now() - startTime
+    })
+
 
     return new Response(JSON.stringify({
       success: true,
@@ -452,6 +518,23 @@ Deno.serve(async (req) => {
 
   } catch (error) {
     console.error("Kritischer Fehler in Select_KDA_Process_From_Trigger:", error);
+
+    // ==========================================
+    // PIPELINE: FEHLERMELDUNG AN STEUERUNGSTABELLE
+    // ==========================================
+    if (supabase) {
+      try {
+        await logPipelineRun(supabase, {
+          jobName: JOB_NAME,
+          status: 'error',
+          collector,
+          fatalErrorMessage: error.message || String(error)
+        })
+      } catch (dbLogErr) {
+        console.error("Fehler beim Schreiben des Error-Logs in pipeline_control:", dbLogErr.message);
+      }
+    }
+
     return new Response(JSON.stringify({
       success: false,
       error_message: (error as Error).message,

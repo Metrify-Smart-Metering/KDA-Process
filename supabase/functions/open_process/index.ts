@@ -1,5 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
+import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 
+
+const JOB_NAME = 'open_process'
 // CORS-Header sind extrem wichtig, da dein Lovable-Frontend 
 // auf einer anderen Domain laufen wird als deine Supabase-Datenbank.
 const corsHeaders = {
@@ -45,6 +48,9 @@ Deno.serve(async (req) => {
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     
     const supabase = createClient(supabaseUrl, supabaseServiceKey)
+    const startTime = Date.now()
+    const collector = new RunErrorCollector()
+
 
     // 4. Token hashen für den DB-Vergleich
     const hashedToken = await sha256(token)
@@ -92,6 +98,7 @@ Deno.serve(async (req) => {
       .select(`
         id,
         customer_label,
+        trigger_id,
         execution_date,
         last_cons_reading,
         last_prod_reading,
@@ -129,9 +136,25 @@ Deno.serve(async (req) => {
       )
     }
 
+    const { data: triggerConfig, error: triggerConfigError } = await supabase
+      .from('Trigger_Config')
+      .select('pictures_mandatory')
+      .eq('id', processData.trigger_id)
+      .maybeSingle()
+
+    if (triggerConfigError) {
+      collector.error(`Trigger-Konfiguration konnte nicht geladen werden: ${triggerConfigError.message}`, { process_id })
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
+      return new Response(
+        JSON.stringify({ error: 'Trigger-Konfiguration konnte nicht geladen werden.' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
     // 8. Erfolgreiche Antwort zurückgeben
     // Wir bauen das Objekt so zusammen, dass die Struktur exakt der alten entspricht!
     // Dadurch wird Ihr Lovable-Frontend überhaupt nicht merken, dass sich die DB-Struktur geändert hat.
+    await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
     return new Response(
       JSON.stringify({
         success: true,
@@ -140,6 +163,7 @@ Deno.serve(async (req) => {
           // Wenn PII bereits gelöscht wurde, geben wir null/Leerwerte zurück
           melo: pii?.melo ?? null,
           brand_key: processData.customer_label, // customer_label ist dein brand_key
+          pictures_mandatory: triggerConfig?.pictures_mandatory ?? false,
           customer: {
             salutation: pii?.customer_salutation ?? null,
             first_name: pii?.customer_f_name ?? null,
@@ -156,6 +180,13 @@ Deno.serve(async (req) => {
     )
 
   } catch (err) {
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    if (supabaseUrl && supabaseServiceKey) {
+      const supabase = createClient(supabaseUrl, supabaseServiceKey)
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'error', fatalErrorMessage: err.message })
+    }
+
     // Falls ein unerwarteter Systemfehler auftritt
     return new Response(
       JSON.stringify({ error: 'Interner Serverfehler', details: err.message }),

@@ -1,5 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
+import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+
+const JOB_NAME = 'Get_Trigger_Data'
 
 // ==========================================
 // CONFIGURATION & VARIABLES
@@ -58,6 +61,9 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders })
   }
 
+  // Supabase-Client deklarieren (wird auch im catch-Block gebraucht)
+  let supabase: any = null;
+
   try {
     console.log("Starte Get_Trigger_Data Edge Function mit erweitertem Logging...");
 
@@ -66,7 +72,9 @@ Deno.serve(async (req) => {
     const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') 
       ?? Deno.env.get('SUPABASE_SECRET_KEY') 
       ?? ''
-    const supabase = createClient(supabaseUrl, supabaseSecretKey)
+    supabase = createClient(supabaseUrl, supabaseSecretKey)
+    const startTime = Date.now()
+    const collector = new RunErrorCollector()
 
     // 2. Datumswerte für Deutschland (Berlin) vorbereiten
     const now = new Date();
@@ -107,6 +115,7 @@ Deno.serve(async (req) => {
 
     if (cleanupError) {
       console.error("[Regel 5] Fehler bei der Altdatenbereinigung:", cleanupError.message);
+      collector.error(`Altdatenbereinigung fehlgeschlagen: ${cleanupError.message}`)
     } else {
       console.log(`[Regel 5] Erfolgreich ${deletedCount ?? 0} veraltete Einträge aus Trigger_Backlog gelöscht.`);
     }
@@ -166,8 +175,8 @@ Deno.serve(async (req) => {
         console.log(`[Regel 2] Zieltag ${KME_TURNUS_TARGET_DATE} erreicht! 'kme_turnus_reg' wird verarbeitet.`);
       }
 
-      if (!viewName) {
-        console.warn(`Konfiguration für Trigger '${triggerId}' hat keinen View-Namen. Überspringe.`);
+      if (!viewName || viewName.trim().toUpperCase() === 'NULL') {
+        console.log(`[Info] Trigger '${triggerId}' ist deaktiviert (View-Name ist leer oder 'NULL'). Überspringe bewusst.`);
         continue;
       }
 
@@ -198,11 +207,8 @@ Deno.serve(async (req) => {
           
           // Robusteres Datumsparsing für Epoch-Tage und falsche V8-Konvertierungen
           const orgExeDateIso = parseSnowflakeDate(rawOrgExeDate);
-
-                    
           // CRITICAL FIX: Da last_true_val in Postgres ein DATE Feld ist, müssen wir es ebenfalls mit parseSnowflakeDate behandeln!
           const lastTrueValIso = parseSnowflakeDate(rawLastTrueVal);
-
 
           if (!melo || !orgExeDateIso) {
             if (processedRowsInView <= 5) {
@@ -230,6 +236,7 @@ Deno.serve(async (req) => {
         console.log(`View-Auswertung beendet: ${rawCandidates.length} gültige Kandidaten im Speicher, ${skippedDates} wegen Regel 3 (< 180 Tage) übersprungen.`);
       } catch (err) {
         console.error(`[View-Fehler] Fehler beim Abrufen der Snowflake-View '${viewName}':`, err.message);
+        collector.error(`Snowflake-View '${viewName}' (Trigger '${triggerId}') fehlgeschlagen: ${err.message}`)
         // Wir fangen Fehler pro View ab, damit andere Views ungestört weiterarbeiten können
       }
     }
@@ -351,6 +358,7 @@ Deno.serve(async (req) => {
 
       if (deleteError) {
         console.error("[DB-Delete-Fehler] Fehler beim Löschen der Duplikate:", deleteError.message);
+        collector.error(`Löschen unterlegener Duplikate fehlgeschlagen: ${deleteError.message}`)
       }
     }
 
@@ -358,23 +366,26 @@ Deno.serve(async (req) => {
     if (inserts.length > 0) {
       console.log(`[DB-Insert] Füge ${inserts.length} neue Einträge in Trigger_Backlog ein...`);
       
-      // Diagnostisches Log des Insert-Payloads zur Fehlereingrenzung
-      console.log("[DB-Insert] Payload-Vorschau (erste 5 Einträge):", JSON.stringify(inserts.slice(0, 5), null, 2));
-
       const { error: insertError } = await supabase
         .from('Trigger_Backlog')
         .insert(inserts);
 
       if (insertError) {
-        console.error("=================== INS-FEHLER DETEKTIERT ===================");
-        console.error("Fehler-Details von Postgres:", insertError.message);
-        console.error("Genaue Payload-Daten, die zum Absturz führten:");
-        console.error(JSON.stringify(inserts, null, 2));
-        console.error("=============================================================");
         throw new Error(`Fehler beim Einfügen der neuen Kandidaten: ${insertError.message}`);
       }
       console.log(`[DB-Insert] Erfolgreich ${inserts.length} Datensätze in Trigger_Backlog geschrieben.`);
     }
+
+    // ==========================================
+    // PIPELINE: ERFOLGSMELDUNG AN STEUERUNGSTABELLE
+    // ==========================================
+    console.log("[Pipeline] Melde Erfolg an pipeline_control...");
+    await logPipelineRun(supabase, {
+      jobName: JOB_NAME,
+      status: 'success',
+      collector,
+      durationMs: Date.now() - startTime
+    })
 
     console.log("Get_Trigger_Data erfolgreich beendet!");
 
@@ -391,6 +402,23 @@ Deno.serve(async (req) => {
 
   } catch (error) {
     console.error("Kritischer Fehler in Edge Function:", error);
+
+    // ==========================================
+    // PIPELINE: FEHLERMELDUNG AN STEUERUNGSTABELLE
+    // ==========================================
+    if (supabase) {
+      try {
+        await logPipelineRun(supabase, {
+          jobName: JOB_NAME,
+          status: 'error',
+          collector,
+          fatalErrorMessage: error.message || String(error)
+        })
+      } catch (dbLogErr) {
+        console.error("Fehler beim Schreiben des Error-Logs in pipeline_control:", dbLogErr.message);
+      }
+    }
+
     return new Response(JSON.stringify({
       success: false,
       error_message: error.message,

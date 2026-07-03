@@ -1,4 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
+import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+
+const JOB_NAME = 'create_upload_url'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -48,6 +51,8 @@ Deno.serve(async (req) => {
       ?? ''
     
     const supabase = createClient(supabaseUrl, supabaseSecretKey)
+    const startTime = Date.now()
+    const collector = new RunErrorCollector()
 
     // 5. Token prüfen (Wie in open_process)
     const hashedToken = await sha256(token)
@@ -133,6 +138,8 @@ Deno.serve(async (req) => {
       .createSignedUploadUrl(storagePath)
 
     if (uploadError || !uploadData) {
+      collector.error(`Upload-Freigabe fehlgeschlagen: ${uploadError?.message}`, { process_id, obis_code })
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
       return new Response(
         JSON.stringify({ error: 'Fehler beim Erstellen der Upload-Freigabe.', details: uploadError?.message }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -142,6 +149,7 @@ Deno.serve(async (req) => {
     // 9. Erfolgreiche Rückgabe
     // Wir geben dem Lovable-Frontend die "signedUrl" (wohin die Datei gesendet werden muss)
     // und den "storagePath" (den wir später in der DB speichern).
+    await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
     return new Response(
       JSON.stringify({
         success: true,
@@ -152,6 +160,13 @@ Deno.serve(async (req) => {
     )
 
   } catch (err) {
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
+    const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('SUPABASE_SECRET_KEY') ?? ''
+    if (supabaseUrl && supabaseSecretKey) {
+      const supabase = createClient(supabaseUrl, supabaseSecretKey)
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'error', fatalErrorMessage: err.message })
+    }
+
     return new Response(
       JSON.stringify({ error: 'Interner Serverfehler', details: err.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }

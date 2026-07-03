@@ -1,31 +1,46 @@
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
+import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 
+const JOB_NAME = 'send-kda-reminders'
+// ==========================================
+// CORS HEADERS
+// ==========================================
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
-// =========================
-// Timing-Konfiguration
-// Fuer Tests einfach DAY_MS durch MINUTE_MS ersetzen
-// =========================
-const MINUTE_MS = 60 * 1000
-const HOUR_MS = 60 * MINUTE_MS
-const DAY_MS = 24 * HOUR_MS
-
-//const SECOND_MAIL_DELAY_MS = 14 * DAY_MS
-//const THIRD_MAIL_DELAY_MS = 21 * DAY_MS
-//const ESTIMATION_MAIL_DELAY_MS = 28 * DAY_MS
-
-const SECOND_MAIL_DELAY_MS = 1 * MINUTE_MS
-const THIRD_MAIL_DELAY_MS = 2 * MINUTE_MS
-const ESTIMATION_MAIL_DELAY_MS = 3 * MINUTE_MS
-
-const SECOND_TOKEN_VALIDITY_MS = 7 * DAY_MS
-const THIRD_TOKEN_VALIDITY_MS = 7 * DAY_MS
-
 type MailType = 'second_mail' | 'escalation_mail' | 'estimated_value_mail'
+
+// =====================================================================
+// >>> BRAND REMINDERS TEMPLATE MAPPING <<<
+// Definiere hier pro customer_label und E-Mail-Typ die SendGrid Template-IDs.
+// ---------------------------------------------------------------------
+const TEMPLATES_BY_BRAND: Record<string, Record<MailType, string>> = {
+  'metrify_standard': {
+    'second_mail': 'd-155279e9a699433b9b6f4afc4cdbdf8e',      // Trage hier die SendGrid Template-ID für die 1. Erinnerung ein
+    'escalation_mail': 'd-b93dc7267dd242be95d6ec37afe95ded',  // Trage hier die SendGrid Template-ID für die letzte Erinnerung ein
+    'estimated_value_mail': 'd-3d6d940e016044b793e1a3d26f41c5c7' // Trage hier die SendGrid Template-ID für die Schätzungs-Bestätigung ein
+  },
+   'dmg_standard': {
+    'second_mail': 'd-0fbfdd6fc239404787a6a47e9716dec3',      // Trage hier die SendGrid Template-ID für die 1. Erinnerung ein
+    'escalation_mail': 'd-040aa27154bc49f3ae22843a13bf91f0',  // Trage hier die SendGrid Template-ID für die letzte Erinnerung ein
+    'estimated_value_mail': 'd-6cea80eff7114c3eb54be17e931691e4' // Trage hier die SendGrid Template-ID für die Schätzungs-Bestätigung ein
+  }
+};
+
+// Fallbacks, falls ein customer_label nicht im Mapping oben existiert
+const DEFAULT_TEMPLATES: Record<MailType, string> = {
+    'second_mail': 'd-155279e9a699433b9b6f4afc4cdbdf8e ',      // Trage hier die SendGrid Template-ID für die 1. Erinnerung ein
+    'escalation_mail': 'd-b93dc7267dd242be95d6ec37afe95ded',  // Trage hier die SendGrid Template-ID für die letzte Erinnerung ein
+    'estimated_value_mail': 'd-3d6d940e016044b793e1a3d26f41c5c7 ' // Trage hier die SendGrid Template-ID für die Schätzungs-Bestätigung ein
+  };
+// =====================================================================
+
+// ==========================================
+// HELPERS
+// ==========================================
 
 function formatDateDE(value: string | Date): string {
   return new Intl.DateTimeFormat('de-DE', {
@@ -35,46 +50,25 @@ function formatDateDE(value: string | Date): string {
   }).format(new Date(value))
 }
 
-function escapeHtml(value: string | null | undefined): string {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;')
+/**
+ * Parsed ein yyyy-mm-dd Datums-String timezone-safe als UTC-Mitternacht.
+ */
+function parseUtcDate(dateStr: string): Date {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
 }
 
-function buildSubtleSupportBlock(supportEmail: string | null | undefined): string {
-  if (!supportEmail) return ''
-
-  return `
-    <div style="margin-top:10px; font-size:11px; color:#9CA3AF; line-height:1.4;">
-      Bei technischen Problemen:
-      <a href="mailto:${escapeHtml(supportEmail)}" style="color:#9CA3AF !important; text-decoration:none;">${escapeHtml(supportEmail)}</a>
-    </div>
-  `
-}
-
-function buildSubject(mailType: MailType, meterNumber: string): string {
-  if (mailType === 'second_mail') {
-    return `Erinnerung: Bitte melden Sie uns Ihren aktuellen Zählerstand für den Zähler ${meterNumber}`
-  }
-
-  if (mailType === 'escalation_mail') {
-    return `Letzte Erinnerung: Bitte melden Sie uns Ihren aktuellen Zählerstand für den Zähler ${meterNumber}`
-  }
-
-  return `Information zur Schätzung Ihres Zählerstands für den Zähler ${meterNumber}`
-}
-
+/**
+ * Erzeugt einen neuen Token, deaktiviert alte, und speichert ihn mit dem exakten Ablaufdatum.
+ */
 async function createAccessTokenForProcess(
   supabase: any,
   processId: number,
-  validityMs: number,
+  expiresAt: Date,
 ): Promise<{ rawToken: string; expiresAtIso: string }> {
   const nowIso = new Date().toISOString()
 
-  // Vorherige noch offene Tokens fuer diesen Prozess deaktivieren
+  // Vorherige noch offene Tokens für diesen Prozess deaktivieren
   const { error: invalidateError } = await supabase
     .from('access_tokens')
     .update({ used_at: nowIso })
@@ -98,7 +92,7 @@ async function createAccessTokenForProcess(
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
 
-  const expiresAtIso = new Date(Date.now() + validityMs).toISOString()
+  const expiresAtIso = expiresAt.toISOString()
 
   const { error: tokenInsertError } = await supabase
     .from('access_tokens')
@@ -115,319 +109,17 @@ async function createAccessTokenForProcess(
   return { rawToken, expiresAtIso }
 }
 
-function buildMailContent(params: {
-  mailType: MailType
-  subject: string
-  companyName: string
-  companyAddress: string
-  customerName: string
-  meterNumber: string
-  executionDateFormatted: string
-  magicLink: string | null
-  primaryColor: string
-  secondaryColor: string
-  supportBlock: string
-}) {
-  const {
-    mailType,
-    subject,
-    companyName,
-    companyAddress,
-    customerName,
-    meterNumber,
-    executionDateFormatted,
-    magicLink,
-    primaryColor,
-    secondaryColor,
-    supportBlock,
-  } = params
-
-  let introHtml = ''
-  let bodyHtml = ''
-  let outroHtml = ''
-
-  if (mailType === 'second_mail') {
-    introHtml = `
-      <p>wir erinnern Sie freundlich daran, uns Ihren aktuellen Zählerstand zu übermitteln.</p>
-
-      <p>
-        Auch wenn unser Ziel ist, Ihren Stromzähler automatisch auszulesen, kann es in einzelnen Fällen vorkommen,
-        dass wir Ihren Zählerstand direkt von Ihnen benötigen - zum Beispiel, wenn Ihr Zähler (noch) nicht mit uns
-        verbunden ist oder es zu technischen Störungen im Betrieb kommt.
-      </p>
-    `
-
-    bodyHtml = `
-      <p>
-        Daher bitten wir Sie, uns Ihren aktuellen Zählerstand zum <strong>${escapeHtml(executionDateFormatted)}</strong> zu übermitteln.
-      </p>
-    `
-
-    outroHtml = `
-      <p>Wir bedanken uns für Ihre Zusammenarbeit.</p>
-    `
-  }
-
-  if (mailType === 'escalation_mail') {
-    introHtml = `
-      <p>bisher haben wir noch keinen Zählerstand von Ihnen erhalten.</p>
-
-      <p>
-        Auch wenn unser Ziel ist, Ihren Stromzähler automatisch auszulesen, kann es in einzelnen Fällen vorkommen,
-        dass wir Ihren Zählerstand direkt von Ihnen benötigen.
-      </p>
-    `
-
-    bodyHtml = `
-      <p>
-        Bitte übermitteln Sie uns Ihren aktuellen Zählerstand nun innerhalb von <strong>7 Tagen</strong>.
-      </p>
-
-      <p>
-        Falls wir innerhalb dieser Frist keinen Zählerstand von Ihnen erhalten, werden wir den Ablesewert schätzen.
-      </p>
-    `
-
-    outroHtml = `
-      <p>Bitte vermeiden Sie eine Schätzung, indem Sie Ihren Zählerstand jetzt übermitteln.</p>
-    `
-  }
-
-  if (mailType === 'estimated_value_mail') {
-    introHtml = `
-      <p>
-        da wir innerhalb der gesetzten Frist keinen Zählerstand von Ihnen erhalten haben,
-        wurde der Ablesewert für Ihren Zähler nun geschätzt.
-      </p>
-    `
-
-    bodyHtml = `
-      <p>
-        Diese Schätzung wurde in unserem Prozess hinterlegt.
-      </p>
-    `
-
-    outroHtml = `
-      <p>Vielen Dank für Ihr Verständnis.</p>
-    `
-  }
-
-  const ctaBlock = magicLink
-    ? `
-      <p>Über den folgenden Button gelangen Sie sicher direkt zur Eingabe. Ein Login oder Passwort ist nicht erforderlich.</p>
-
-      <div class="btn-container">
-        <a
-          href="${escapeHtml(magicLink)}"
-          class="btn"
-          target="_blank"
-          style="background-color:${primaryColor} !important; color:#ffffff !important; text-decoration:none !important; display:inline-block; padding:14px 32px; border-radius:8px; font-size:16px; font-weight:bold;"
-        >
-          <span style="color:#ffffff !important; text-decoration:none !important;">Zählerstand jetzt melden</span>
-        </a>
-      </div>
-
-      <p>Dieser Link ist aus Sicherheitsgründen zeitlich begrenzt gültig und verfällt automatisch.</p>
-    `
-    : ''
-
-  return `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${escapeHtml(subject)}</title>
-  <style>
-    body {
-      font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-      background-color: #f4f7f6;
-      margin: 0;
-      padding: 0;
-      -webkit-font-smoothing: antialiased;
-    }
-    .wrapper {
-      width: 100%;
-      background-color: #f4f7f6;
-      padding: 40px 0;
-    }
-    .container {
-      max-width: 600px;
-      margin: 0 auto;
-      background-color: #ffffff;
-      border-radius: 12px;
-      overflow: hidden;
-      box-shadow: 0 4px 15px rgba(0,0,0,0.05);
-    }
-    .header {
-      background-color: ${secondaryColor};
-      padding: 30px;
-      text-align: center;
-    }
-    .logo {
-      font-size: 24px;
-      font-weight: bold;
-      color: ${primaryColor};
-      letter-spacing: 0.5px;
-    }
-    .content {
-      padding: 40px 30px;
-      color: #374151;
-      line-height: 1.6;
-    }
-    h1 {
-      font-size: 22px;
-      color: #111827;
-      margin-top: 0;
-      font-weight: 700;
-    }
-    p {
-      font-size: 16px;
-      margin: 0 0 20px 0;
-    }
-    .btn-container {
-      text-align: center;
-      margin: 35px 0;
-    }
-    .btn,
-    .btn:link,
-    .btn:visited,
-    .btn:hover,
-    .btn:active {
-      background-color: ${primaryColor} !important;
-      color: #ffffff !important;
-      padding: 14px 32px;
-      font-weight: bold;
-      text-decoration: none !important;
-      border-radius: 8px;
-      font-size: 16px;
-      display: inline-block;
-      box-shadow: 0 4px 6px rgba(0,0,0,0.12);
-    }
-    .footer {
-      background-color: #f9fafb;
-      padding: 25px 30px;
-      text-align: center;
-      font-size: 13px;
-      color: #6B7280;
-      border-top: 1px solid #f3f4f6;
-    }
-    .security-note {
-      font-size: 12px;
-      color: #9CA3AF;
-      margin-top: 25px;
-      padding-top: 15px;
-      border-top: 1px dashed #E5E7EB;
-      text-align: left;
-    }
-    .meter-box {
-      background: #f9fafb;
-      border: 1px solid #e5e7eb;
-      border-radius: 10px;
-      padding: 14px 18px;
-      margin: 24px 0;
-      font-size: 15px;
-    }
-    .meter-label {
-      color: #6b7280;
-      display: block;
-      margin-bottom: 4px;
-    }
-    .meter-value {
-      color: #111827;
-      font-size: 18px;
-      font-weight: 700;
-    }
-  </style>
-</head>
-<body>
-  <div class="wrapper">
-    <div class="container">
-      <div class="header">
-        <div class="logo">${escapeHtml(companyName)}</div>
-      </div>
-
-      <div class="content">
-        <h1>Hallo ${escapeHtml(customerName)},</h1>
-
-        ${introHtml}
-
-        ${bodyHtml}
-
-        <div class="meter-box">
-          <span class="meter-label">Zählernummer</span>
-          <span class="meter-value">${escapeHtml(meterNumber)}</span>
-        </div>
-
-        ${ctaBlock}
-
-        ${outroHtml}
-
-        <div class="security-note">
-          <strong>Sicherheitshinweis:</strong> Dieser Link ist personenbezogen und nur für die einmalige Übermittlung Ihres Zählerstands vorgesehen. Bitte teilen Sie ihn nicht mit Dritten.
-        </div>
-      </div>
-
-      <div class="footer">
-        <strong>${escapeHtml(companyName)}</strong><br>
-        ${escapeHtml(companyAddress)}
-        ${supportBlock}
-      </div>
-    </div>
-  </div>
-</body>
-</html>
-  `
-}
-
-async function sendMail(params: {
-  sendgridApiKey: string
-  recipientEmail: string
-  fromEmail: string
-  senderName: string
-  subject: string
-  html: string
-}) {
-  const { sendgridApiKey, recipientEmail, fromEmail, senderName, subject, html } = params
-
-  const sendgridResponse = await fetch('https://api.sendgrid.com/v3/mail/send', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${sendgridApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      personalizations: [
-        {
-          to: [{ email: recipientEmail }]
-        }
-      ],
-      from: {
-        email: fromEmail,
-        name: senderName
-      },
-      subject,
-      content: [
-        {
-          type: 'text/html',
-          value: html
-        }
-      ]
-    })
-  })
-
-  if (!sendgridResponse.ok) {
-    const errorBody = await sendgridResponse.text()
-    throw new Error(`SendGrid API meldet Fehler-Code ${sendgridResponse.status}: ${errorBody}`)
-  }
-}
-
+// ==========================================
+// MAIN HANDLER
+// ==========================================
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
   }
 
   try {
+    console.log("=== send-kda-reminders Edge Function gestartet ===");
+
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
     const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     const sendgridApiKey = Deno.env.get('SENDGRID_API_KEY')
@@ -442,8 +134,30 @@ Deno.serve(async (req) => {
     }
 
     const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
-    const nowMs = Date.now()
 
+    const startTime = Date.now()
+    const collector = new RunErrorCollector()
+
+
+    // Heutiges UTC Datum auf Mitternacht normalisieren für exakten Kalendertage-Vergleich
+    const now = new Date()
+    const todayUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+    console.log(`[Info] Heutiges Datum (UTC Mitternacht): ${todayUtc.toISOString()}`)
+
+    // 1. Trigger_Config laden -> Map nach id
+    console.log("[Load] Lade Trigger_Config...");
+    const { data: configs, error: configErr } = await supabase
+      .from('Trigger_Config')
+      .select('*')
+    if (configErr || !configs) {
+      throw new Error(`Trigger-Konfigurationen konnten nicht geladen werden: ${configErr?.message}`)
+    }
+    const configMap = new Map<string, any>()
+    for (const c of configs) configMap.set(c.id, c)
+    console.log(`[Load] ${configs.length} Trigger-Konfigurationen geladen.`);
+
+    // 2. Offene, unübermittelte KDA-Prozesse laden (Status 1, 2, 3)
+    console.log("[Load] Suche fällige Prozesse...");
     const { data: processes, error: processError } = await supabase
       .from('Process_Database')
       .select(`
@@ -453,7 +167,8 @@ Deno.serve(async (req) => {
         execution_date,
         submitted_at,
         mail_sent_at,
-        kda_status
+        kda_status,
+        trigger_id
       `)
       .in('kda_status', [1, 2, 3])
       .is('submitted_at', null)
@@ -462,6 +177,7 @@ Deno.serve(async (req) => {
     if (processError) {
       throw new Error(`Prozesse konnten nicht geladen werden: ${processError.message}`)
     }
+    console.log(`[Load] ${processes?.length ?? 0} offene Prozesse zur Prüfung geladen.`);
 
     const results: Array<Record<string, unknown>> = []
 
@@ -473,38 +189,100 @@ Deno.serve(async (req) => {
         const executionDate = process.execution_date as string | null
         const mailSentAt = process.mail_sent_at as string | null
         const currentStatus = process.kda_status as number
+        const triggerId = process.trigger_id as string | null
 
-        if (!processId || !customerLabel || !piiId || !mailSentAt) {
-          throw new Error('Prozessdaten unvollständig.')
+        if (!processId || !customerLabel || !piiId || !mailSentAt || !executionDate || !triggerId) {
+          throw new Error('Prozessdaten unvollständig (ID, Label, PII, mail_sent_at, execution_date oder trigger_id fehlt).')
         }
 
-        const elapsedMs = nowMs - new Date(mailSentAt).getTime()
+        const cfg = configMap.get(triggerId)
+        if (!cfg) {
+          throw new Error(`Keine Trigger_Config für '${triggerId}' gefunden.`)
+        }
+
+        // Intervalle aus Trigger_Config (mit robusten Fallbacks)
+        const secondReminderDays = cfg.second_reminder_interval_days !== undefined && cfg.second_reminder_interval_days !== null
+          ? Number(cfg.second_reminder_interval_days)
+          : 14 // 14 Tage als Fallback
+
+        const daysUntilSubstitute = cfg.days_until_substitute_value !== undefined && cfg.days_until_substitute_value !== null
+          ? Number(cfg.days_until_substitute_value)
+          : 7 // 7 Tage als Fallback
+
+        // 3. Berechnung der Tage seit dem Execution Date (timezone-safe per UTC)
+        const executionDateObj = parseUtcDate(executionDate)
+        const diffTime = todayUtc.getTime() - executionDateObj.getTime()
+        let daysSinceExecution = Math.floor(diffTime / (1000 * 60 * 60 * 24))
+
+        console.log(`[Process ID: ${processId}] daysSinceExecution = ${daysSinceExecution} (executionDate: ${executionDate})`)
+
+        // =====================================================================
+        // >>> TEST-MODUS / TIME-OVERRIDE <<<
+        // Wenn du mit Minuten testen willst, kommentiere diesen Block ein und setze
+        // die Test-Abstände am Anfang der Datei auf Minuten-Basis.
+        // ---------------------------------------------------------------------
+        /*
+        const elapsedMinutes = Math.floor((Date.now() - new Date(mailSentAt).getTime()) / (1000 * 60));
+        let daysSinceExecutionOverride = -1;
+        if (currentStatus === 1 && elapsedMinutes >= 1) {
+          daysSinceExecutionOverride = 0; // Triggert sofort 1. Reminder
+        } else if (currentStatus === 2 && elapsedMinutes >= 2) {
+          daysSinceExecutionOverride = secondReminderDays; // Triggert 2. Reminder
+        } else if (currentStatus === 3 && elapsedMinutes >= 3) {
+          daysSinceExecutionOverride = secondReminderDays + daysUntilSubstitute; // Triggert Schätzungs-Mail
+        }
+        if (daysSinceExecutionOverride >= 0) {
+          daysSinceExecution = daysSinceExecutionOverride;
+        }
+        */
+        // =====================================================================
 
         let mailType: MailType | null = null
         let nextStatus: number | null = null
-        let tokenValidityMs: number | null = null
+        let tokenExpiresAt: Date | null = null
+        let linkValidityDays: number | null = null
 
-        if (currentStatus === 1 && elapsedMs >= SECOND_MAIL_DELAY_MS) {
+        // Timing-Logik
+        if (currentStatus === 1 && daysSinceExecution >= 0) {
+          // First Reminder: Am Tag des Execution Dates
           mailType = 'second_mail'
           nextStatus = 2
-          tokenValidityMs = SECOND_TOKEN_VALIDITY_MS
-        } else if (currentStatus === 2 && elapsedMs >= THIRD_MAIL_DELAY_MS) {
+          
+          // Token gültig exakt bis zum zweiten Reminder (execution_date + second_reminder_interval_days)
+          tokenExpiresAt = new Date(executionDateObj.getTime())
+          tokenExpiresAt.setDate(tokenExpiresAt.getDate() + secondReminderDays)
+          
+          linkValidityDays = Math.max(1, secondReminderDays - daysSinceExecution)
+        } 
+        else if (currentStatus === 2 && daysSinceExecution >= secondReminderDays) {
+          // Second Reminder: 'second_reminder_interval_days' nach dem Execution Date
           mailType = 'escalation_mail'
           nextStatus = 3
-          tokenValidityMs = THIRD_TOKEN_VALIDITY_MS
-        } else if (currentStatus === 3 && elapsedMs >= ESTIMATION_MAIL_DELAY_MS) {
+          
+          // Token gültig exakt bis zur Ersatzwert-Ermittlung (execution_date + second_reminder_interval_days + days_until_substitute_value)
+          tokenExpiresAt = new Date(executionDateObj.getTime())
+          tokenExpiresAt.setDate(tokenExpiresAt.getDate() + secondReminderDays + daysUntilSubstitute)
+          
+          linkValidityDays = Math.max(1, (secondReminderDays + daysUntilSubstitute) - daysSinceExecution)
+        } 
+        else if (currentStatus === 3 && daysSinceExecution >= (secondReminderDays + daysUntilSubstitute)) {
+          // Substitute value confirmation mail: 'days_until_substitute_value' + 'second_reminder_interval_days' nach dem Execution Date
           mailType = 'estimated_value_mail'
-          nextStatus = 50
-          tokenValidityMs = null
-        } else {
+          nextStatus = 50 // Status 50 = Ersatzwert gebildet / Schätzung abgeschlossen
+          tokenExpiresAt = null // Kein neuer Token notwendig bei Schätz-Bestätigung
+          linkValidityDays = null
+        } 
+        else {
           results.push({
             process_id: processId,
             action: 'skipped_not_due',
             current_status: currentStatus,
+            days_since_execution: daysSinceExecution
           })
           continue
         }
 
+        // 4. Kundendaten (PII) laden
         const { data: piiData, error: piiError } = await supabase
           .from('Customer_PII')
           .select('customer_mail, customer_f_name, customer_l_name, meter_number')
@@ -515,6 +293,7 @@ Deno.serve(async (req) => {
           throw new Error(`PII-Daten konnten nicht geladen werden: ${piiError?.message ?? 'Kein Datensatz gefunden.'}`)
         }
 
+        // 5. Branding-/Absenderdaten laden
         const { data: labelData, error: labelError } = await supabase
           .from('customer_labels')
           .select(`
@@ -522,8 +301,6 @@ Deno.serve(async (req) => {
             company_name,
             company_address,
             sender_name,
-            brand_primary_color,
-            brand_secondary_color,
             support_email
           `)
           .eq('customer_label', customerLabel)
@@ -550,61 +327,90 @@ Deno.serve(async (req) => {
         const fromEmail = labelData.out_email
         const senderName = labelData.sender_name || labelData.company_name || 'Kundenservice'
         const companyName = labelData.company_name || senderName
-        const companyAddress = labelData.company_adress || ''
-        const primaryColor = labelData.brand_primary_color || '#10B981'
-        const secondaryColor = labelData.brand_secondary_color || '#111827'
-        const supportBlock = buildSubtleSupportBlock(labelData.support_email)
+        const companyAddress = labelData.company_address || ''
+        const supportEmail = labelData.support_email || null
 
         if (!fromEmail) {
           throw new Error(`Keine out_email für customer_label "${customerLabel}" vorhanden.`)
         }
 
+        // 6. Token erzeugen und in DB abspeichern (falls ein neuer benötigt wird)
         let magicLink: string | null = null
-
-        if (tokenValidityMs !== null) {
+        if (tokenExpiresAt !== null) {
           const { rawToken } = await createAccessTokenForProcess(
             supabase,
             processId,
-            tokenValidityMs,
+            tokenExpiresAt,
           )
-
           magicLink = `${portalUrl}?id=${processId}&t=${rawToken}`
+          console.log(`[Token] Neuer Token für Prozess ${processId} generiert. Gültig bis ${tokenExpiresAt.toISOString()}`);
         }
 
-        const subject = buildSubject(mailType, meterNumber)
         const executionDateFormatted = executionDate ? formatDateDE(executionDate) : '-'
 
-        const html = buildMailContent({
-          mailType,
-          subject,
-          companyName,
-          companyAddress,
-          customerName,
-          meterNumber,
-          executionDateFormatted,
-          magicLink,
-          primaryColor,
-          secondaryColor,
-          supportBlock,
+        // 7. Template-ID basierend auf customer_label & mailType ermitteln
+        const brandMap = TEMPLATES_BY_BRAND[customerLabel] || DEFAULT_TEMPLATES
+        const templateId = brandMap[mailType]
+        console.log(`[SendGrid] Gewählte Template-ID für Label '${customerLabel}' & Typ '${mailType}': ${templateId}`)
+
+        // 8. Betreff (Fallback)
+        const subject = mailType === 'second_mail'
+          ? `Erinnerung: Bitte melden Sie uns Ihren aktuellen Zählerstand für den Zähler ${meterNumber}`
+          : mailType === 'escalation_mail'
+            ? `Letzte Erinnerung: Bitte melden Sie uns Ihren aktuellen Zählerstand für den Zähler ${meterNumber}`
+            : `Information zur Schätzung Ihres Zählerstands für den Zähler ${meterNumber}`
+
+        // 9. SendGrid E-Mail via Template API absenden
+        const sendgridResponse = await fetch('https://api.sendgrid.com/v3/mail/send', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${sendgridApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            personalizations: [
+              {
+                to: [{ email: recipientEmail }],
+                custom_args: {
+                  kda_source: 'kda-system'
+                },
+                dynamic_template_data: {
+                  customerName: customerName,
+                  executionDateFormatted: executionDateFormatted,
+                  meterNumber: meterNumber,
+                  magicLink: magicLink,
+                  linkValidityDays: linkValidityDays,
+                  companyName: companyName,
+                  companyAddress: companyAddress,
+                  supportEmail: supportEmail,
+                }
+              }
+            ],
+            from: {
+              email: fromEmail,
+              name: senderName
+            },
+            subject: subject,
+            template_id: templateId
+          })
         })
 
-        await sendMail({
-          sendgridApiKey,
-          recipientEmail,
-          fromEmail,
-          senderName,
-          subject,
-          html,
-        })
+        if (!sendgridResponse.ok) {
+          const errorBody = await sendgridResponse.text()
+          throw new Error(`SendGrid API meldet Fehler-Code ${sendgridResponse.status}: ${errorBody}`)
+        }
 
+        // 10. kda_status im Prozess aktualisieren
         const { error: updateError } = await supabase
           .from('Process_Database')
           .update({ kda_status: nextStatus })
           .eq('id', processId)
 
         if (updateError) {
-          throw new Error(`kda_status konnte nicht aktualisiert werden: ${updateError.message}`)
+          throw new Error(`kda_status konnte nicht auf ${nextStatus} aktualisiert werden: ${updateError.message}`)
         }
+
+        console.log(`[Success] E-Mail '${mailType}' erfolgreich gesendet an ${recipientEmail}. Neuer Status: ${nextStatus}`)
 
         results.push({
           process_id: processId,
@@ -613,29 +419,56 @@ Deno.serve(async (req) => {
           new_status: nextStatus,
           recipient_email: recipientEmail,
         })
+
       } catch (processErr) {
+        const msg = processErr instanceof Error ? processErr.message : String(processErr)
+        console.error(`[Fehler] Prozess ${process.id} fehlgeschlagen:`, processErr)
+        collector.error(msg, { process_id: process.id })
         results.push({
           process_id: process.id,
           action: 'error',
-          error: processErr instanceof Error ? processErr.message : String(processErr),
+          error: msg,
         })
       }
     }
 
+    await logPipelineRun(supabase, {
+      jobName: JOB_NAME,
+      status: 'success',
+      collector,
+      durationMs: Date.now() - startTime
+    })
+
     return new Response(JSON.stringify({
       success: true,
       processed_at: new Date().toISOString(),
+      warnings: collector.warningCount,
+      errors: collector.errorCount,
       results,
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 200,
     })
+
   } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
     console.error('Fehler in send-kda-reminders:', error)
+
+    // supabase-Client neu aufbauen, falls der Fehler vor dessen Initialisierung auftrat
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
+    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    if (supabaseUrl && supabaseServiceRoleKey) {
+      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+      await logPipelineRun(supabase, {
+        jobName: JOB_NAME,
+        status: 'error',
+        fatalErrorMessage: msg
+      })
+    }
 
     return new Response(JSON.stringify({
       success: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: msg,
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 500,

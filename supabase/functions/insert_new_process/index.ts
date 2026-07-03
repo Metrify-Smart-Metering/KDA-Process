@@ -1,5 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
+import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+
+const JOB_NAME = 'insert_new_process'
 
 // ==========================================
 // CORS HEADERS
@@ -94,16 +97,48 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders });
   }
 
+  // Supabase-Client deklarieren (damit er im catch-Block zur Verfügung steht)
+  let supabase: any = null;
+
   try {
     console.log("=== insert_new_process Edge Function gestartet ===");
 
-    // 1. Supabase Client init
+    // 1. Webhook Payload sichern und auswerten
+    let payload: any = null;
+    try {
+      const reqText = await req.text();
+      if (reqText) {
+        payload = JSON.parse(reqText);
+      }
+    } catch (e) {
+      console.log("[Pipeline] Konnte Request-Body nicht als JSON parsen. Fahre ohne Webhook-Filterung fort.");
+    }
+
+    // Pipeline-Filter: Falls der Aufruf von unserem Webhook auf pipeline_control kommt
+    if (payload && payload.type === 'INSERT' && payload.table === 'pipeline_control') {
+      const jobName = payload.record?.job_name;
+      const status = payload.record?.status;
+
+      if (jobName !== 'Select_KDA_Process_From_Trigger' || status !== 'success') {
+        console.log(`[Pipeline] Ignoriere Event für Job '${jobName}' mit Status '${status}'.`);
+        return new Response(JSON.stringify({ message: "Ignoriert", success: true }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+          status: 200
+        });
+      }
+      console.log("[Pipeline] Webhook empfangen: Select_KDA_Process_From_Trigger war erfolgreich! Starte Verarbeitung...");
+    }
+
+    // 2. Supabase Client mit Service Role initialisieren (RLS-Bypass)
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
     const supabaseSecretKey =
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ??
       Deno.env.get('SUPABASE_SECRET_KEY') ??
       '';
-    const supabase = createClient(supabaseUrl, supabaseSecretKey);
+    supabase = createClient(supabaseUrl, supabaseSecretKey);
+    const startTime = Date.now()
+    const collector = new RunErrorCollector()
+
 
     // Heutiges Datum (Europe/Berlin) bestimmen
     const now = new Date();
@@ -118,7 +153,7 @@ Deno.serve(async (req) => {
     const todayIso = `${year}-${month}-${day}`;
     console.log(`[Info] Heutiges Datum (Berlin): ${todayIso}`);
 
-    // 2. Trigger_Config laden -> Map nach id (kleingeschrieben analog zu den anderen Funktionen)
+    // 3. Trigger_Config laden -> Map nach id
     console.log("[Load] Trigger_Config laden...");
     const { data: configs, error: configErr } = await supabase
       .from('Trigger_Config')
@@ -130,7 +165,7 @@ Deno.serve(async (req) => {
     for (const c of configs) configMap.set(c.id, c);
     console.log(`[Load] ${configs.length} Konfigurationen geladen.`);
 
-    // 3. Alle accepted Trigger_Backlog Einträge laden
+    // 4. Alle accepted Trigger_Backlog Einträge laden
     console.log("[Load] Suche nach accepted Backlog-Einträgen...");
     const { data: acceptedBacklog, error: backlogErr } = await supabase
       .from('Trigger_Backlog')
@@ -150,13 +185,21 @@ Deno.serve(async (req) => {
     console.log(`[Load] ${unprocessedBacklog.length} davon sind neu und unverarbeitet.`);
 
     if (unprocessedBacklog.length === 0) {
+      // Auch hier: Melde trotzdem Erfolg, damit der Pipeline-Lauf im Log vollständig ist!
+      console.log("[Pipeline] Keine neuen accepted Backlog-Einträge. Melde Erfolg an pipeline_control...");
+      await logPipelineRun(supabase, {
+        jobName: JOB_NAME,
+        status: 'success',
+        collector,
+        durationMs: Date.now() - startTime
+      })
       return new Response(JSON.stringify({
         success: true,
         message: "Keine unverarbeiteten accepted Backlog-Einträge zu verarbeiten."
       }), { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 });
     }
 
-    // 4. Laufende/Bestehende Prozesse laden, um Doppel-Kreation zu verhindern
+    // 5. Laufende/Bestehende Prozesse laden, um Doppel-Kreation zu verhindern
     const melos = unprocessedBacklog.map(r => String(getField(r, ['Melo', 'melo']) ?? '').trim()).filter(Boolean);
     console.log(`[Load] Prüfe bestehende Prozesse für ${melos.length} Melos...`);
     
@@ -176,6 +219,7 @@ Deno.serve(async (req) => {
       
       if (procErr) {
         console.warn(`[Warn] Bestehende Prozesse konnten nicht geladen werden: ${procErr.message}`);
+        collector.warn(`Bestehende Prozesse konnten nicht geladen werden: ${procErr.message}`)
       } else {
         existingProcs = procData ?? [];
       }
@@ -205,7 +249,7 @@ Deno.serve(async (req) => {
     let countAlreadyExists = 0;
     let countFailed = 0;
 
-    // 5. Einzelne Verarbeitung der accepted Kandidaten
+    // 6. Einzelne Verarbeitung der accepted Kandidaten
     for (const rec of unprocessedBacklog) {
       const recId = getField(rec, ['Trigger_Candidate_ID', 'id']);
       const melo = String(getField(rec, ['Melo', 'melo']) ?? '').trim();
@@ -251,7 +295,7 @@ Deno.serve(async (req) => {
         continue;
       }
 
-      // 6. Snowflake Abfrage für die PII- und Prozessdaten dieser Melo ausführen
+      // 7. Snowflake Abfrage für die PII- und Prozessdaten dieser Melo ausführen
       console.log(`[Snowflake] Abfrage auf View '${viewName}' für Melo '${melo}'...`);
       let customerRow: any = null;
       try {
@@ -278,6 +322,7 @@ Deno.serve(async (req) => {
         }
       } catch (err) {
         console.error(`[Snowflake-Fehler] Konnte Daten aus View '${viewName}' nicht abrufen:`, err.message);
+        collector.error(`Snowflake-View '${viewName}' fehlgeschlagen: ${err.message}`, { melo, trigger_candidate_id: recId })
       }
 
       // Echte PII Felder aus der View (sobald sie verfügbar sind)
@@ -323,7 +368,6 @@ Deno.serve(async (req) => {
         ]);
         const consDate = getField(customerRow, [
           'period_date_1_8_0', 'PERIOD_DATE_1_8_0'
-  
         ]);
         if (consVal !== null && consVal !== undefined && consVal !== '') {
           lastConsReading = {
@@ -378,6 +422,7 @@ Deno.serve(async (req) => {
 
       if (piiInsertErr || !piiInserted) {
         console.error(`[DB-Fehler] Customer_PII konnte nicht angelegt werden:`, piiInsertErr?.message);
+        collector.error(`Customer_PII konnte nicht angelegt werden: ${piiInsertErr?.message}`, { melo, trigger_candidate_id: recId })
         countFailed++;
         continue;
       }
@@ -399,6 +444,7 @@ Deno.serve(async (req) => {
 
       if (procInsertErr || !procInserted) {
         console.error(`[DB-Fehler] Process_Database konnte nicht angelegt werden:`, procInsertErr?.message);
+        collector.error(`Process_Database konnte nicht angelegt werden: ${procInsertErr?.message}`, { melo, trigger_candidate_id: recId })
         // Aufräumen des verwaisten PII-Eintrags
         await supabase.from('Customer_PII').delete().eq('id', piiInserted.id);
         countFailed++;
@@ -415,6 +461,7 @@ Deno.serve(async (req) => {
 
       if (backlogUpdateErr) {
         console.warn(`[Warn] Backlog ID ${recId} konnte nicht mit der Prozess-ID verknüpft werden:`, backlogUpdateErr.message);
+        collector.warn(`Backlog ID ${recId} konnte nicht mit Prozess-ID verknüpft werden: ${backlogUpdateErr.message}`)
       }
 
       // Registriere im Speicher für nachfolgende Iterationen im selben Lauf
@@ -422,7 +469,18 @@ Deno.serve(async (req) => {
       countCreated++;
     }
 
-    console.log(`=== insert_new_process beendet: ${countCreated} Prozesse erstellt, ${countAlreadyExists} bereits vorhanden, ${countFailed} fehlgeschlagen ===`);
+    console.log(`=== insert_new_process beendet: ${countCreated} Prozesse erstellt ===`);
+
+    // ==========================================
+    // PIPELINE: ERFOLGSMELDUNG AN STEUERUNGSTABELLE
+    // ==========================================
+    console.log("[Pipeline] Melde Erfolg an pipeline_control...");
+    await logPipelineRun(supabase, {
+      jobName: JOB_NAME,
+      status: 'success',
+      collector,
+      durationMs: Date.now() - startTime
+    })
 
     return new Response(JSON.stringify({
       success: true,
@@ -437,6 +495,23 @@ Deno.serve(async (req) => {
 
   } catch (error) {
     console.error("Kritischer Fehler in insert_new_process:", error);
+
+    // ==========================================
+    // PIPELINE: FEHLERMELDUNG AN STEUERUNGSTABELLE
+    // ==========================================
+    if (supabase) {
+      try {
+        await logPipelineRun(supabase, {
+          jobName: JOB_NAME,
+          status: 'error',
+          collector,
+          fatalErrorMessage: error.message || String(error)
+        })
+      } catch (dbLogErr) {
+        console.error("Fehler beim Schreiben des Error-Logs in pipeline_control:", dbLogErr.message);
+      }
+    }
+
     return new Response(JSON.stringify({
       success: false,
       error_message: (error as Error).message,

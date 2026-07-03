@@ -1,5 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
+import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+
+const JOB_NAME = 'evaluate-plausibility'
 
 // CORS Headers (falls die Funktion doch mal direkt per HTTP-Post aufgerufen wird)
 const corsHeaders = {
@@ -7,6 +10,11 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
+
+// ==========================================
+// REPETITION-TRIGGER KONSTANTE
+// ==========================================
+const REPETITION_TRIGGER_ID = 'implausible_value_repetion';
 
 Deno.serve(async (req) => {
   console.log("==================================================");
@@ -57,39 +65,50 @@ Deno.serve(async (req) => {
     console.log(`📊 [Status-Vergleich] Alt: ${oldRecord?.kda_status} -> Neu: ${record.kda_status}`);
     console.log(`📊 [Werte-Input] cons_val (Bezug): ${record.cons_val}, prod_val (Einspeisung): ${record.prod_val}`);
 
-    // 4. Prüfen, ob wir überhaupt aktiv werden müssen
-    const isTargetStatus = record.kda_status === 4;
-    const wasAlreadyStatus4 = oldRecord?.kda_status === 4;
-
-    if (!isTargetStatus) {
-      console.log(`ℹ️ [Skip] Keine Aktion erforderlich. Status ist nicht 4 (ist: ${record.kda_status}).`);
-      return new Response("Keine Aktion erforderlich (Status ist nicht 4).", { status: 200 });
+    // ---------- 2. Trigger-Bedingung ----------
+    if (record.kda_status !== 4) {
+      return new Response("Keine Aktion (Status != 4).", { status: 200 });
+    }
+    if (oldRecord?.kda_status === 4) {
+      return new Response("Keine Aktion (bereits verarbeitet).", { status: 200 });
     }
 
-    if (wasAlreadyStatus4) {
-      console.log("ℹ️ [Skip] Keine Aktion erforderlich. Status war bereits vor diesem Update 4 (Vermeidung von Endlosschleifen).");
-      return new Response("Keine Aktion erforderlich (Bereits verarbeitet).", { status: 200 });
-    }
-
-    console.log("🎯 [Match] Status-Bedingungen erfüllt! Starte Plausibilitätsprüfung...");
-
-    // 5. Supabase-Client initialisieren
-    console.log("🔑 Initialisiere Supabase-Verbindung...");
+    // ---------- 3. Supabase ----------
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SECRET_KEY');
-
     if (!supabaseUrl || !supabaseSecretKey) {
-      throw new Error("Fehlende Supabase-Umgebungsvariablen (SUPABASE_URL oder SERVICE_ROLE_KEY)!");
+      throw new Error("Fehlende Supabase-Umgebungsvariablen!");
     }
     const supabase = createClient(supabaseUrl, supabaseSecretKey);
+    const startTime = Date.now()
+    const collector = new RunErrorCollector()
+
+// 6. Stammdaten (MeLo & Zählernummer) über Customer_PII Relation laden
 
     // 6. Stammdaten (MeLo & Zählernummer) über Customer_PII Relation laden
     console.log(`💾 Frage Stammdaten aus Postgres ab für Process-ID: ${record.id}...`);
     const { data: processData, error: processError } = await supabase
-       .from('Process_Database')
-       .select('reading_date, created_at, customer_pii_id, Customer_PII(melo, meter_number)')
-       .eq('id', record.id)
-       .single();
+      .from('Process_Database')
+      .select(`
+        id,
+        reading_date,
+        created_at,
+        customer_pii_id,
+        customer_label,
+        trigger_id,
+        last_cons_reading,
+        last_prod_reading,
+        Customer_PII (
+          melo,
+          meter_number
+        )
+      `)
+      .eq('id', record.id)
+      .single();
+       
+    if (!processData.customer_label) {
+      throw new Error(`Dem alten Prozess ${record.id} fehlt customer_label.`);
+    }
 
     if (processError) {
       console.error("❌ [DB ERROR] Fehler beim Laden der Process_Database / Customer_PII:");
@@ -102,7 +121,8 @@ Deno.serve(async (req) => {
       throw new Error("Prozess-Datensatz existiert nicht.");
     }
 
-    const pii = processData.Customer_PII;
+    const piiRaw = processData.Customer_PII;
+    const pii = Array.isArray(piiRaw) ? (piiRaw[0] ?? null) : piiRaw;
     const melo = pii?.melo;
     const meterNumber = pii?.meter_number;
     const readingDate = processData.reading_date || processData.created_at?.split('T')[0];
@@ -122,9 +142,7 @@ Deno.serve(async (req) => {
       return new Response("Prüfung abgebrochen wegen fehlender Stammdaten.", { status: 200 });
     }
 
-    // -------------------------------------------------------------------------
-    // OPTIMIERUNG: Extrahierter, wiederverwendbarer Snowflake-Prozedur-Helper
-    // -------------------------------------------------------------------------
+    // ---------- 5. Snowflake-Plausibilitätscheck ----------
     const runPlausibilityCheck = async (obisCode: string, rawVal: any, label: string) => {
       const val = parseFloat(String(rawVal));
       if (isNaN(val)) {
@@ -134,7 +152,6 @@ Deno.serve(async (req) => {
 
       console.log(`❄️ [Snowflake Helper] Starte Abfrage für ${label} (${obisCode}): ${val} kWh`);
       const sql = `CALL OPERATIONS_SANDBOX.KDA.EVALUATE_KDA_READING(?, ?, ?, ?, ?)`;
-      
       const snowflakeResult = await executeSnowflakeQuery('primary', sql, {
         "1": { type: "TEXT", value: String(melo) },
         "2": { type: "TEXT", value: String(meterNumber) },
@@ -158,9 +175,6 @@ Deno.serve(async (req) => {
       }
     };
 
-    // -------------------------------------------------------------------------
-    // OPTIMIERUNG: Parallelisierung der Snowflake-Abfragen mit Promise.all
-    // -------------------------------------------------------------------------
     const evaluationPromises: Promise<{ type: 'cons' | 'prod', score: number, isSuspicious: boolean }>[] = [];
 
     // Bezugswert-Prüfung (1.8.0) registrieren
@@ -213,60 +227,163 @@ Deno.serve(async (req) => {
     const isPlausible = isConsPlausible && isProdPlausible && !isSuspicious;
     const nextStatus = isPlausible ? 100 : 9; // 100 = Freigegeben (plausibel), 9 = Review (unplausibel)
 
-    console.log(`⚖️ [Entscheidung] Bezug plausibel: ${isConsPlausible}, Einspeisung plausibel: ${isProdPlausible}, Verdächtig: ${isSuspicious}`);
-    console.log(`⚖️ [Entscheidung] Errechneter kda_status: ${nextStatus} (${isPlausible ? 'PLAUSIBEL 🎉' : 'MANUELLER REVIEW 🔍'})`);
+    // ============================================================
+    // FALL A: PLAUSIBEL → Status 100, fertig
+    // ============================================================
+    if (isPlausible) {
+      console.log(`✅ Plausibel — setze Status 100.`);
+      const { error: upErr } = await supabase
+        .from('Process_Database')
+        .update({ kda_status: 100 })
+        .eq('id', record.id);
+      if (upErr) throw new Error(`Update fehlgeschlagen: ${upErr.message}`);
 
-    // 10. Status in Supabase aktualisieren
-    console.log(`💾 Aktualisiere Postgres: Setze kda_status = ${nextStatus} für ID ${record.id}...`);
-    const { error: updateError } = await supabase
-      .from('Process_Database')
-      .update({
-        kda_status: nextStatus
-        //last_cons_reading: consScore,
-        //last_prod_reading: prodScore
-      })
-      .eq('id', record.id);
-
-    if (updateError) {
-      console.error("❌ [DB UPDATE ERROR] Status-Update in Postgres fehlgeschlagen!");
-      console.error(JSON.stringify(updateError, null, 2));
-      throw new Error(`Fehler beim Schreiben des neuen Status: ${updateError.message}`);
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
+      return new Response(
+        JSON.stringify({ success: true, status: 100, scores: { cons: consScore, prod: prodScore } }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
     }
 
-    console.log(`✅ [FERTIG] Prozess ${record.id} erfolgreich verarbeitet. Status ist nun ${nextStatus}.`);
-    console.log("==================================================");
+// ============================================================
+// FALL B: UNPLAUSIBEL → erweiterte Logik
+
+    // ============================================================
+    // FALL B: UNPLAUSIBEL → erweiterte Logik
+    // ============================================================
+    console.log("🔍 Wert unplausibel — starte erweiterte Logik...");
+
+    // B1. Bilder-Check: gibt es submission_files für diesen Prozess?
+    const { count: fileCount, error: fileErr } = await supabase
+      .from('submission_files')
+      .select('*', { count: 'exact', head: true })
+      .eq('process_id', record.id);
+
+    if (fileErr) {
+      console.warn(`⚠️ submission_files Lookup fehlgeschlagen: ${fileErr.message} — verhalte mich wie 'keine Bilder'.`);
+      collector.warn(`submission_files Lookup fehlgeschlagen: ${fileErr.message}`, { process_id: record.id })
+    }
+    const hasPictures = (fileCount ?? 0) > 1;
+    console.log(`📷 Bilder vorhanden: ${hasPictures} (count=${fileCount ?? 1})`);
+
+    // Wenn Bilder vorhanden → klassischer Review (Status 9), fertig
+    if (hasPictures) {
+      console.log(`📷 Bilder vorhanden → Status 9 (manueller Review).`);
+      await supabase.from('Process_Database').update({ kda_status: 9 }).eq('id', record.id);
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
+      return new Response(
+        JSON.stringify({ success: true, status: 9, branch: 'has_pictures', scores: { cons: consScore, prod: prodScore } }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // B2. Schleifenschutz: war der aktuelle Prozess selbst schon ein Wiederholungs-Prozess?
+    if (processData.trigger_id === REPETITION_TRIGGER_ID) {
+      console.log(`🔁 Aktueller Prozess ist bereits Wiederholungs-Prozess → Status 50 (Estimated), Schleifenschutz.`);
+      await supabase.from('Process_Database').update({ kda_status: 50 }).eq('id', record.id);
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
+      return new Response(
+        JSON.stringify({ success: true, status: 50, branch: 'loop_guard' }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // B3. 60-Tage-Check: gibt es einen anderen Prozess für gleiche Melo mit kda_status=9 in den letzten 60 Tagen?
+    const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Wir müssen über Customer_PII joinen, um nach Melo zu filtern
+    const { data: priorUnplausible, error: priorErr } = await supabase
+      .from('Process_Database')
+      .select('id, kda_status, created_at, Customer_PII!inner(melo)')
+      .eq('kda_status', 9)
+      .eq('Customer_PII.melo', melo)
+      .gte('created_at', sixtyDaysAgo)
+      .neq('id', record.id)
+      .limit(1);
+
+    if (priorErr) {
+      console.warn(`⚠️ 60-Tage-Lookup fehlgeschlagen: ${priorErr.message}`);
+      collector.warn(`60-Tage-Lookup fehlgeschlagen: ${priorErr.message}`, { process_id: record.id })
+    }
+
+    const hasPriorUnplausible = (priorUnplausible?.length ?? 0) > 0;
+    console.log(`🕰️ Vorherige unplausible Werte (60 Tage, gleiche Melo): ${hasPriorUnplausible}`);
+
+    if (hasPriorUnplausible) {
+      console.log(`🕰️ Bereits unplausibler Wert vorhanden → Status 50 (Estimated).`);
+      await supabase.from('Process_Database').update({ kda_status: 50 }).eq('id', record.id);
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
+      return new Response(
+        JSON.stringify({ success: true, status: 50, branch: 'prior_unplausible_exists' }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // B4. Wiederholungs-Prozess erstellen
+    console.log(`🆕 Erstelle Wiederholungs-Prozess für Melo ${melo}...`);
+
+    // Alter Prozess bleibt auf 9 (für Sichtbarkeit)
+    await supabase.from('Process_Database').update({ kda_status: 9 }).eq('id', record.id);
+
+    // execution_date = heute + 7 Tage
+    const today = new Date();
+    const execDate = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const execDateIso = execDate.toISOString().split('T')[0];
+
+    const { data: newProc, error: insertErr } = await supabase
+      .from('Process_Database')
+      .insert({
+        customer_pii_id: processData.customer_pii_id,
+        customer_label: processData.customer_label,
+        trigger_id: REPETITION_TRIGGER_ID,
+        execution_date: execDateIso,
+        kda_status: 0, // klassischer Weg
+        last_cons_reading: processData.last_cons_reading,
+        last_prod_reading: processData.last_prod_reading,
+      })
+      .select()
+      .single();
+
+    if (insertErr || !newProc) {
+      console.error(`❌ Konnte Wiederholungs-Prozess nicht erstellen: ${insertErr?.message}`);
+      throw new Error(`Wiederholungs-Insert fehlgeschlagen: ${insertErr?.message}`);
+    }
+
+    console.log(`✅ Wiederholungs-Prozess angelegt (ID: ${newProc.id}, Exec: ${execDateIso}).`);
 
     return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: `Status erfolgreich auf ${nextStatus} gesetzt.`,
-        scores: { cons: consScore, prod: prodScore } 
+      JSON.stringify({
+        success: true,
+        status: 9,
+        branch: 'repetition_created',
+        old_process_id: record.id,
+        new_process_id: newProc.id,
+        new_execution_date: execDateIso,
+        scores: { cons: consScore, prod: prodScore }
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
 
   } catch (globalError) {
-    console.error("🚨 [KRITISCHER FEHLER] Unbehandelte Ausnahme in der Edge Function!");
-    console.error(globalError.stack || globalError.message || globalError);
-    console.log("==================================================");
-
-    // Wir versuchen im Fehlerfall, die ID auf den Review-Status (9) zu setzen, damit der Prozess nicht im Status 4 hängenbleibt.
+    console.error("🚨 Unbehandelte Ausnahme:", globalError.stack || globalError.message);
+    // Recovery: setze auf 9, damit der Prozess nicht im Status 4 hängenbleibt
     try {
       const payload = JSON.parse(await req.clone().text());
       const record = payload.record || payload.new_record;
       if (record?.id) {
-        console.log(`🩹 [Recovery] Versuche kda_status für ID ${record.id} auf 9 zu setzen...`);
         const supabaseUrl = Deno.env.get('SUPABASE_URL');
         const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SECRET_KEY');
         if (supabaseUrl && supabaseSecretKey) {
           const supabase = createClient(supabaseUrl, supabaseSecretKey);
           await supabase.from('Process_Database').update({ kda_status: 9 }).eq('id', record.id);
-          console.log(`🩹 [Recovery] Status erfolgreich auf 9 gesetzt.`);
+          await logPipelineRun(supabase, {
+            jobName: JOB_NAME,
+            status: 'error',
+            fatalErrorMessage: globalError.message
+          });
         }
       }
-    } catch (recoveryError) {
-      console.error("❌ [Recovery] Konnte kda_status im Fehlerfall nicht op 9 setzen:", recoveryError.message);
-    }
+    } catch (_) {}
 
     return new Response(
       JSON.stringify({ error: 'Interner Serverfehler', details: globalError.message }),

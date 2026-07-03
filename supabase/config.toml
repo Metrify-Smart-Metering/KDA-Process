@@ -516,3 +516,47 @@ entrypoint = "./functions/insert_new_process/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/insert_new_process/*.html" ]
+
+[functions.handle-email-events]
+enabled = true
+verify_jwt = false
+import_map = "./functions/handle-email-events/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/handle-email-events/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/handle-email-events/*.html" ]
+
+[functions.send-kda-teams-report]
+enabled = true
+verify_jwt = false
+import_map = "./functions/send-kda-teams-report/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/send-kda-teams-report/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/send-kda-teams-report/*.html" ]
+
+[functions.submit_reviewed_values]
+enabled = true
+verify_jwt = false
+import_map = "./functions/submit_reviewed_values/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/submit_reviewed_values/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/submit_reviewed_values/*.html" ]
+
+[functions.send-weekly-kda-report]
+enabled = true
+verify_jwt = false
+import_map = "./functions/send-weekly-kda-report/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/send-weekly-kda-report/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/send-weekly-kda-report/*.html" ]

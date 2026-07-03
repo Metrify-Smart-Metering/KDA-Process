@@ -1,10 +1,33 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
+import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 
+const JOB_NAME = 'submit_process'
+
+// ==========================================
+// CORS HEADERS
+// ==========================================
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
+
+// =====================================================================
+// >>> BRAND SUBMISSION CONFIRMATION TEMPLATE MAPPING <<<
+// Definiere hier pro customer_label die SendGrid Template-ID für die Bestätigungs-Mail.
+// ---------------------------------------------------------------------
+const BRAND_SUBMISSION_TEMPLATES: Record<string, string> = {
+  'metrify_standard': 'd-6bcac00bee144cd9a78cf075128bd86a', // Trage hier deine SendGrid Template-ID ein
+  'dmg_standard': 'd-c9b7698665c54e84a8d81a9f71d1de08', // Beispiel für ein weiteres Label
+};
+
+// Fallback, falls ein customer_label nicht im Mapping oben existiert
+const DEFAULT_SUBMISSION_TEMPLATE_ID = 'd-6bcac00bee144cd9a78cf075128bd86a';
+// =====================================================================
+
+// ==========================================
+// HELPERS
+// ==========================================
 
 // Hilfsfunktion zum Hashen des Tokens (SHA-256)
 async function sha256(message: string): Promise<string> {
@@ -14,15 +37,6 @@ async function sha256(message: string): Promise<string> {
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
-function escapeHtml(value: string | number | null | undefined): string {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;')
-}
-
 function formatNumberDE(value: number): string {
   return new Intl.NumberFormat('de-DE', {
     minimumFractionDigits: 0,
@@ -30,17 +44,9 @@ function formatNumberDE(value: number): string {
   }).format(value)
 }
 
-function buildSubtleSupportBlock(supportEmail: string | null | undefined): string {
-  if (!supportEmail) return ''
-
-  return `
-    <div style="margin-top:10px; font-size:11px; color:#9CA3AF; line-height:1.4;">
-      Bei technischen Problemen:
-      <a href="mailto:${escapeHtml(supportEmail)}" style="color:#9CA3AF !important; text-decoration:none;">${escapeHtml(supportEmail)}</a>
-    </div>
-  `
-}
-
+/**
+ * Sendet die Bestätigungs-E-Mail über die SendGrid Dynamic Template API.
+ */
 async function sendSubmissionConfirmationEmail(params: {
   sendgridApiKey: string
   recipientEmail: string
@@ -48,13 +54,12 @@ async function sendSubmissionConfirmationEmail(params: {
   senderName: string
   companyName: string
   companyAddress: string
-  primaryColor: string
-  secondaryColor: string
   supportEmail?: string | null
   customerName: string
   meterNumber: string
   consVal: number
   prodVal: number | null
+  templateId: string
 }) {
   const {
     sendgridApiKey,
@@ -63,155 +68,29 @@ async function sendSubmissionConfirmationEmail(params: {
     senderName,
     companyName,
     companyAddress,
-    primaryColor,
-    secondaryColor,
     supportEmail,
     customerName,
     meterNumber,
     consVal,
     prodVal,
+    templateId,
   } = params
 
-  const subject = `Vielen Dank fuer Ihre Zaehlerstandsmeldung fuer den Zaehler ${meterNumber}`
-  const supportBlock = buildSubtleSupportBlock(supportEmail)
+  const subject = `Vielen Dank für Ihre Zählerstandsmeldung für den Zähler ${meterNumber}`
 
-  const prodValueBlock = prodVal !== null
-    ? `
-      <tr>
-        <td style="padding:10px 0; color:#6b7280; font-size:14px;">Einspeisung (2.8.0)</td>
-        <td style="padding:10px 0; color:#111827; font-size:14px; font-weight:700; text-align:right;">${escapeHtml(formatNumberDE(prodVal))}</td>
-      </tr>
-    `
-    : ''
+  // Daten für deine Handlebars-Platzhalter im SendGrid HTML-Template aufbereiten
+  const dynamicTemplateData = {
+    customerName: customerName,
+    meterNumber: meterNumber,
+    consumptionValue: formatNumberDE(consVal),
+    productionValue: prodVal !== null ? formatNumberDE(prodVal) : null, // {{#if productionValue}} greift nur, wenn befüllt
+    companyName: companyName,
+    companyAddress: companyAddress,
+    supportEmail: supportEmail || null,
+    logoUrl: true // Schaltet das Logo im Template frei
+  }
 
-  const html = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${escapeHtml(subject)}</title>
-  <style>
-    body {
-      font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-      background-color: #f4f7f6;
-      margin: 0;
-      padding: 0;
-      -webkit-font-smoothing: antialiased;
-    }
-    .wrapper {
-      width: 100%;
-      background-color: #f4f7f6;
-      padding: 40px 0;
-    }
-    .container {
-      max-width: 600px;
-      margin: 0 auto;
-      background-color: #ffffff;
-      border-radius: 12px;
-      overflow: hidden;
-      box-shadow: 0 4px 15px rgba(0,0,0,0.05);
-    }
-    .header {
-      background-color: ${secondaryColor};
-      padding: 30px;
-      text-align: center;
-    }
-    .logo {
-      font-size: 24px;
-      font-weight: bold;
-      color: ${primaryColor};
-      letter-spacing: 0.5px;
-    }
-    .content {
-      padding: 40px 30px;
-      color: #374151;
-      line-height: 1.6;
-    }
-    h1 {
-      font-size: 22px;
-      color: #111827;
-      margin-top: 0;
-      font-weight: 700;
-    }
-    p {
-      font-size: 16px;
-      margin: 0 0 20px 0;
-    }
-    .value-box {
-      background: #f9fafb;
-      border: 1px solid #e5e7eb;
-      border-radius: 12px;
-      padding: 20px 18px;
-      margin: 24px 0;
-    }
-    .footer {
-      background-color: #f9fafb;
-      padding: 25px 30px;
-      text-align: center;
-      font-size: 13px;
-      color: #6B7280;
-      border-top: 1px solid #f3f4f6;
-    }
-    .security-note {
-      font-size: 12px;
-      color: #9CA3AF;
-      margin-top: 25px;
-      padding-top: 15px;
-      border-top: 1px dashed #E5E7EB;
-      text-align: left;
-    }
-  </style>
-</head>
-<body>
-  <div class="wrapper">
-    <div class="container">
-      <div class="header">
-        <div class="logo">${escapeHtml(companyName)}</div>
-      </div>
-
-      <div class="content">
-        <h1>Vielen Dank, ${escapeHtml(customerName)}!</h1>
-
-        <p>vielen Dank fuer Ihre Mithilfe und die Uebermittlung Ihres aktuellen Zaehlersstands.</p>
-
-        <p>Wir haben folgende Angaben zu Ihrem Zaehler erhalten:</p>
-
-        <div class="value-box">
-          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">
-            <tr>
-              <td style="padding:10px 0; color:#6b7280; font-size:14px;">Zaehlernummer</td>
-              <td style="padding:10px 0; color:#111827; font-size:14px; font-weight:700; text-align:right;">${escapeHtml(meterNumber)}</td>
-            </tr>
-            <tr>
-              <td style="padding:10px 0; color:#6b7280; font-size:14px;">Bezug (1.8.0)</td>
-              <td style="padding:10px 0; color:#111827; font-size:14px; font-weight:700; text-align:right;">${escapeHtml(formatNumberDE(consVal))}</td>
-            </tr>
-            ${prodValueBlock}
-          </table>
-        </div>
-
-        <p>Ihre Angaben werden nun von uns geprueft.</p>
-
-        <p>Falls es Rueckfragen oder Unstimmigkeiten gibt, melden wir uns noch einmal bei Ihnen.</p>
-
-        <p>Vielen Dank fuer Ihre Zusammenarbeit.</p>
-
-        <div class="security-note">
-          Diese E-Mail bestaetigt lediglich den Eingang Ihrer Meldung.
-        </div>
-      </div>
-
-      <div class="footer">
-        <strong>${escapeHtml(companyName)}</strong><br>
-        ${escapeHtml(companyAddress)}
-        ${supportBlock}
-      </div>
-    </div>
-  </div>
-</body>
-</html>
-  `
+  console.log(`[SendGrid] Sende Bestätigung an ${recipientEmail} mit Template ID '${templateId}'...`);
 
   const sendgridResponse = await fetch('https://api.sendgrid.com/v3/mail/send', {
     method: 'POST',
@@ -222,20 +101,19 @@ async function sendSubmissionConfirmationEmail(params: {
     body: JSON.stringify({
       personalizations: [
         {
-          to: [{ email: recipientEmail }]
+          to: [{ email: recipientEmail }],
+          custom_args: {
+            kda_source: 'kda-system'
+          },
+          dynamic_template_data: dynamicTemplateData
         }
       ],
       from: {
         email: fromEmail,
         name: senderName
       },
-      subject,
-      content: [
-        {
-          type: 'text/html',
-          value: html
-        }
-      ]
+      subject: subject, // Metadaten-Betreff (Fallback)
+      template_id: templateId
     })
   })
 
@@ -245,6 +123,9 @@ async function sendSubmissionConfirmationEmail(params: {
   }
 }
 
+// ==========================================
+// MAIN HANDLER
+// ==========================================
 Deno.serve(async (req) => {
   // 1. CORS Preflight abfangen
   if (req.method === 'OPTIONS') {
@@ -252,6 +133,8 @@ Deno.serve(async (req) => {
   }
 
   try {
+    console.log("=== submit_process Edge Function gestartet ===");
+
     // 2. Request-Parameter auslesen
     const { 
       process_id, 
@@ -264,20 +147,15 @@ Deno.serve(async (req) => {
       customer_plz
     } = await req.json()
 
-
-
     // 3. Pflichtfelder validieren
     if (!process_id || !token || !customer_plz || cons_val === undefined || cons_val === null || !reading_date) {
-
       return new Response(
         JSON.stringify({ error: 'Fehlende Pflichtfelder (process_id, token, cons_val oder reading_date).' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
-
     }
 
     const parsedReadingDate = new Date(reading_date)
-
     if (Number.isNaN(parsedReadingDate.getTime())) {
       return new Response(
         JSON.stringify({ error: 'reading_date ist kein gueltiges Datum.' }),
@@ -285,9 +163,7 @@ Deno.serve(async (req) => {
       )
     }
 
-const normalizedReadingDate = parsedReadingDate.toISOString()
-
-
+    const normalizedReadingDate = parsedReadingDate.toISOString()
     const parsedConsVal = parseFloat(cons_val)
     const parsedProdVal =
       prod_val !== undefined && prod_val !== null && prod_val !== ''
@@ -316,8 +192,9 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
       ?? ''
 
     const sendgridApiKey = Deno.env.get('SENDGRID_API_KEY')
-
     const supabase = createClient(supabaseUrl, supabaseSecretKey)
+    const startTime = Date.now()
+    const collector = new RunErrorCollector()
 
     // 5. Token hashen und in "access_tokens" pruefen
     const hashedToken = await sha256(token)
@@ -345,6 +222,7 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
     }
 
     // 6. Prozess + Kundendaten + Branding laden
+    console.log(`[Load] Lade Prozess-Daten für ID ${process_id}...`);
     const { data: processData, error: processError } = await supabase
       .from('Process_Database')
       .select(`
@@ -366,6 +244,7 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
+
     const storedPlz = String(processData.Customer_PII?.customer_plz ?? '').trim()
     const inputPlz = String(customer_plz).trim()
 
@@ -376,7 +255,6 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
       )
     }
 
-
     if (processData.kda_status >= 4 || processData.submitted_at !== null) {
       return new Response(
         JSON.stringify({ error: 'Fuer diesen Fall wurden bereits Werte eingereicht.' }),
@@ -384,6 +262,7 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
       )
     }
 
+    console.log(`[Load] Lade PII für ID ${processData.customer_pii_id}...`);
     const { data: piiData, error: piiError } = await supabase
       .from('Customer_PII')
       .select('customer_mail, customer_f_name, customer_l_name, meter_number')
@@ -391,12 +270,15 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
       .single()
 
     if (piiError || !piiData) {
+      collector.error(`Kundendaten konnten nicht geladen werden: ${piiError?.message}`, { process_id })
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
       return new Response(
         JSON.stringify({ error: 'Kundendaten konnten nicht geladen werden.' }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
+    console.log(`[Load] Lade Branding für Label '${processData.customer_label}'...`);
     const { data: labelData, error: labelError } = await supabase
       .from('customer_labels')
       .select(`
@@ -412,6 +294,8 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
       .single()
 
     if (labelError || !labelData) {
+      collector.error(`Branding-Daten konnten nicht geladen werden: ${labelError?.message}`, { process_id })
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
       return new Response(
         JSON.stringify({ error: 'Branding-Daten konnten nicht geladen werden.' }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -440,11 +324,14 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
     }
 
     if (filesToInsert.length > 0) {
+      console.log(`[DB] Trage ${filesToInsert.length} Bilder in submission_files ein...`);
       const { error: fileError } = await supabase
         .from('submission_files')
         .insert(filesToInsert)
 
       if (fileError) {
+        collector.error(`Bilddaten-Verknüpfung fehlgeschlagen: ${fileError.message}`, { process_id })
+        await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
         return new Response(
           JSON.stringify({ error: 'Fehler beim Verknuepfen der Bilddaten.', details: fileError.message }),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -454,27 +341,28 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
 
     // 8. Haupttabelle "Process_Database" aktualisieren
     const submittedAt = new Date().toISOString()
-
+    console.log(`[DB] Aktualisiere Prozess ${process_id} mit eingereichten Zählerständen...`);
     const { error: updateError } = await supabase
       .from('Process_Database')
       .update({
-        cons_val: parseFloat(cons_val),
-        prod_val: prod_val ? parseFloat(prod_val) : null,
+        cons_val: parsedConsVal,
+        prod_val: parsedProdVal,
         reading_date: normalizedReadingDate,
-        kda_status: 4,
-        submitted_at: new Date().toISOString(),
+        kda_status: 4, // Status 4 = Erfolgreich eingereicht
+        submitted_at: submittedAt,
       })
       .eq('id', process_id)
 
-
     if (updateError) {
+      collector.error(`Speichern der Zählerstände fehlgeschlagen: ${updateError.message}`, { process_id })
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
       return new Response(
         JSON.stringify({ error: 'Fehler beim Speichern der Zaehlerstaende.', details: updateError.message }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
-    // 9. Bestaetigungs-E-Mail senden (nicht-kritisch)
+    // 9. Bestaetigungs-E-Mail senden (Dynamic SendGrid Template)
     try {
       const recipientEmail = piiData.customer_mail
       const firstName = piiData.customer_f_name || 'Kundin/Kunde'
@@ -488,6 +376,9 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
         meterNumber &&
         labelData.out_email
       ) {
+        // Template-ID basierend auf customer_label bestimmen
+        const templateId = BRAND_SUBMISSION_TEMPLATES[processData.customer_label] || DEFAULT_SUBMISSION_TEMPLATE_ID;
+
         await sendSubmissionConfirmationEmail({
           sendgridApiKey,
           recipientEmail,
@@ -495,22 +386,23 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
           senderName: labelData.sender_name || labelData.company_name || 'Kundenservice',
           companyName: labelData.company_name || labelData.sender_name || 'Kundenservice',
           companyAddress: labelData.company_address || '',
-          primaryColor: labelData.brand_primary_color || '#10B981',
-          secondaryColor: labelData.brand_secondary_color || '#111827',
           supportEmail: labelData.support_email,
           customerName,
           meterNumber,
           consVal: parsedConsVal,
           prodVal: parsedProdVal,
+          templateId: templateId
         })
       } else {
         console.warn(`Bestaetigungs-E-Mail fuer Prozess ${process_id} wurde uebersprungen, da Daten oder SENDGRID_API_KEY fehlen.`)
       }
     } catch (mailError) {
       console.error(`Bestaetigungs-E-Mail fuer Prozess ${process_id} konnte nicht gesendet werden:`, mailError)
+      collector.error(`Bestätigungs-E-Mail konnte nicht gesendet werden: ${mailError.message}`, { process_id })
     }
 
     // 10. Token entwerten (One-Time-Sicherheit)
+    console.log(`[DB] Entwerte genutzten Token...`);
     const { error: tokenUseError } = await supabase
       .from('access_tokens')
       .update({ used_at: submittedAt })
@@ -518,9 +410,18 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
 
     if (tokenUseError) {
       console.error(`Kritisch: Token ${tokenData.id} konnte nicht entwertet werden!`, tokenUseError)
+      collector.error(`Token konnte nicht entwertet werden (Sicherheitsrisiko: Link bleibt gültig!): ${tokenUseError.message}`, { process_id, token_id: tokenData.id })
     }
 
     // 11. Erfolgsantwort
+    console.log(`[Success] Einreichung für Prozess ${process_id} erfolgreich verarbeitet.`);
+    await logPipelineRun(supabase, {
+      jobName: JOB_NAME,
+      status: 'success',
+      collector,
+      durationMs: Date.now() - startTime
+    })
+
     return new Response(
       JSON.stringify({
         success: true,
@@ -530,6 +431,15 @@ const normalizedReadingDate = parsedReadingDate.toISOString()
     )
 
   } catch (err) {
+    console.error("Kritischer interner Fehler in submit_process:", err);
+
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
+    const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('SUPABASE_SECRET_KEY') ?? ''
+    if (supabaseUrl && supabaseSecretKey) {
+      const supabase = createClient(supabaseUrl, supabaseSecretKey)
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'error', fatalErrorMessage: err.message })
+    }
+
     return new Response(
       JSON.stringify({ error: 'Interner Serverfehler', details: err.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
