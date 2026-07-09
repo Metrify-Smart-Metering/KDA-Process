@@ -215,6 +215,27 @@ Deno.serve(async (req) => {
       throw new Error(`Power Automate Webhook Fehler ${paResponse.status}: ${errText}`)
     }
 
+    // 6.5. Erfolgreich exportierte Accepted-Faelle auf Status 1000 setzen
+    const acceptedProcessIds = (acceptedRows ?? []).map(r => r.id).filter(Boolean)
+
+    if (acceptedProcessIds.length > 0) {
+      console.log(`[DB] Setze ${acceptedProcessIds.length} exportierte Accepted-Faelle auf kda_status 1000...`)
+
+      const { error: statusUpdateError } = await supabase
+        .from('Process_Database')
+        .update({ kda_status: 1000 })
+        .in('id', acceptedProcessIds)
+        .eq('kda_status', 100)
+
+      if (statusUpdateError) {
+        throw new Error(
+          `CSV-Export war erfolgreich, aber kda_status konnte nicht auf 1000 gesetzt werden: ${statusUpdateError.message}`
+        )
+      }
+
+      console.log(`[Success] ${acceptedProcessIds.length} Prozesse erfolgreich auf Status 1000 gesetzt.`)
+    }
+
     // 7. Erfolgreichen Lauf in pipeline_control protokollieren
     await logPipelineRun(supabase, {
       jobName: JOB_NAME,

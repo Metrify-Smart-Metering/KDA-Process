@@ -291,12 +291,14 @@ Deno.serve(async (req) => {
         processRows = procData ?? [];
       }
     }
-
+    const DEAD_END_STATUSES = [50, 404];
     const processByMelo = new Map<string, any[]>();
     for (const p of processRows) {
-      // "Laufender" Prozess: alles, das noch nicht final Werte eingereicht / abgeschlossen hat (kda_status < 4)
       const statusNum = Number(getField(p, ['kda_status', 'status']) ?? -1);
-      if (!Number.isNaN(statusNum) && statusNum >= 4) continue;
+      if (!Number.isNaN(statusNum) && DEAD_END_STATUSES.includes(statusNum)) {
+        console.log(`[Skip:dead_end_status] Process ${p.id} hat Dead-End-Status ${statusNum}. Blockiert keinen neuen Trigger.`);
+        continue;
+      }
 
       const pii = p.Customer_PII;
       let meloFromJoin = null;
@@ -317,7 +319,7 @@ Deno.serve(async (req) => {
       if (!processByMelo.has(cleanMelo)) processByMelo.set(cleanMelo, []);
       processByMelo.get(cleanMelo)!.push(p);
     }
-    console.log(`[Load] ${processRows.length} Process_Database-Zeilen geladen, ${processByMelo.size} Melos mit aktiven Prozessen gemappt.`);
+    console.log(`[Load] ${processRows.length} Process_Database-Zeilen geladen, ${processByMelo.size} Melos mit blockierenden Prozessen gemappt (Dead-Ends ${DEAD_END_STATUSES.join('/')} ausgenommen).`);
 
 
     // 7. Pro Backlog-Eintrag die Regeln (3a -> 3e) anwenden

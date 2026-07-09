@@ -94,7 +94,7 @@ Deno.serve(async (req) => {
     // 7. Daten aus "Process_Database" und "Customer_PII" via JOIN holen
     // Wir fragen nun die PII-Felder über die Relation "Customer_PII" ab.
     const { data: processData, error: processError } = await supabase
-      .from('Process_Database')
+      .from('Process_Database') 
       .select(`
         id,
         customer_label,
@@ -107,12 +107,13 @@ Deno.serve(async (req) => {
         Customer_PII (
           customer_f_name,
           customer_l_name,
-          customer_salutation,
+          customer_salutation,                
           melo,
           meter_number,
           customer_plz
         )
       `)
+
       .eq('id', process_id)
       .single()
 

@@ -99,6 +99,8 @@ Deno.serve(async (req) => {
 
   // Supabase-Client deklarieren (damit er im catch-Block zur Verfügung steht)
   let supabase: any = null;
+  const startTime = Date.now()
+  const collector = new RunErrorCollector()
 
   try {
     console.log("=== insert_new_process Edge Function gestartet ===");
@@ -136,8 +138,7 @@ Deno.serve(async (req) => {
       Deno.env.get('SUPABASE_SECRET_KEY') ??
       '';
     supabase = createClient(supabaseUrl, supabaseSecretKey);
-    const startTime = Date.now()
-    const collector = new RunErrorCollector()
+ 
 
 
     // Heutiges Datum (Europe/Berlin) bestimmen
@@ -335,10 +336,10 @@ Deno.serve(async (req) => {
       const customerLabel     = getField(customerRow, ['customer_label', 'brand_key', 'brand']);
 
       // =====================================================================
-      // >>> TEST-FALLBACK: PII mit Dummy-Daten ueberschreiben <<<
+      // >>> TEST-FALLBACK: PII mit Dummy-Daten ueberschreiben <<
       // Diesen Block auskommentieren, sobald die Views echte PII liefern.
       // ---------------------------------------------------------------------
-      const USE_TEST_PII_FALLBACK = true;
+      const USE_TEST_PII_FALLBACK = false;
       if (USE_TEST_PII_FALLBACK) {
         customerFirstName  = 'Erik';
         customerLastName   = 'Beiersdorf';
