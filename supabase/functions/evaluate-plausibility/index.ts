@@ -199,7 +199,8 @@ Deno.serve(async (req) => {
 
     let consScore = 100;
     let prodScore = 100;
-    let isSuspicious = false;
+    let consSuspicious = false;
+    let prodSuspicious = false;
 
     if (evaluationPromises.length > 0) {
       console.log(`⚡ [Promise.all] Starte ${evaluationPromises.length} Snowflake-Abfragen parallel...`);
@@ -209,23 +210,42 @@ Deno.serve(async (req) => {
       for (const res of results) {
         if (res.type === 'cons') {
           consScore = res.score;
+          consSuspicious = res.isSuspicious;
         } else if (res.type === 'prod') {
           prodScore = res.score;
-        }
-        if (res.isSuspicious) {
-          isSuspicious = true;
+          prodSuspicious = res.isSuspicious;
         }
       }
     } else {
       console.log("ℹ️ Keine Werte zum Validieren vorhanden (weder cons_val noch prod_val übergeben).");
     }
 
-    // 9. Finale Auswertung & Entscheidung
-    const isConsPlausible = record.cons_val !== undefined && record.cons_val !== null ? (consScore >= 33.4) : true;
-    const isProdPlausible = record.prod_val !== undefined && record.prod_val !== null ? (prodScore >= 33.4) : true;
-    
-    const isPlausible = isConsPlausible && isProdPlausible && !isSuspicious;
-    const nextStatus = isPlausible ? 100 : 9; // 100 = Freigegeben (plausibel), 9 = Review (unplausibel)
+    // Scores in Process_Database persistieren, unabhängig vom weiteren Ausgang.
+    // Das schafft eine nachvollziehbare Historie, welcher Wert wie bewertet wurde.
+    const { error: scoreUpdateError } = await supabase
+      .from('Process_Database')
+      .update({
+        cons_plausibility_score: consScore,
+        prod_plausibility_score: prodScore,
+      })
+      .eq('id', record.id);
+
+    if (scoreUpdateError) {
+      console.warn(`⚠️ Plausibilitäts-Scores konnten nicht gespeichert werden: ${scoreUpdateError.message}`);
+      collector.warn(`Plausibilitäts-Scores konnten nicht gespeichert werden: ${scoreUpdateError.message}`, { process_id: record.id });
+    }
+
+    // 9. Finale Auswertung & Entscheidung — cons und prod bleiben bewusst getrennt,
+    // damit wir später wissen, WELCHER Wert unplausibel war (nicht nur "irgendetwas").
+    const isConsImplausible = (record.cons_val !== undefined && record.cons_val !== null)
+      ? (consScore < 33.4 || consSuspicious)
+      : false;
+    const isProdImplausible = (record.prod_val !== undefined && record.prod_val !== null)
+      ? (prodScore < 33.4 || prodSuspicious)
+      : false;
+
+    const isPlausible = !isConsImplausible && !isProdImplausible;
+    const nextStatus = isPlausible ? 100 : 9; // Platzhalter, wird unten in Fall B ggf. überschrieben
 
     // ============================================================
     // FALL A: PLAUSIBEL → Status 100, fertig
@@ -245,34 +265,55 @@ Deno.serve(async (req) => {
       );
     }
 
-// ============================================================
-// FALL B: UNPLAUSIBEL → erweiterte Logik
-
     // ============================================================
     // FALL B: UNPLAUSIBEL → erweiterte Logik
     // ============================================================
-    console.log("🔍 Wert unplausibel — starte erweiterte Logik...");
+    console.log(`🔍 Unplausibel — cons: ${isConsImplausible}, prod: ${isProdImplausible}. Starte erweiterte Logik...`);
 
-    // B1. Bilder-Check: gibt es submission_files für diesen Prozess?
-    const { count: fileCount, error: fileErr } = await supabase
+    // B1. Bilder-Check: existiert für JEDEN unplausiblen Wert ein passendes Bild
+    // (obis_code 1.8.0 für cons, 2.8.0 für prod)?
+    const { count: consPictureCount, error: consFileErr } = await supabase
       .from('submission_files')
       .select('*', { count: 'exact', head: true })
-      .eq('process_id', record.id);
+      .eq('process_id', record.id)
+      .eq('obis_code', '1.8.0');
 
-    if (fileErr) {
-      console.warn(`⚠️ submission_files Lookup fehlgeschlagen: ${fileErr.message} — verhalte mich wie 'keine Bilder'.`);
-      collector.warn(`submission_files Lookup fehlgeschlagen: ${fileErr.message}`, { process_id: record.id })
+    const { count: prodPictureCount, error: prodFileErr } = await supabase
+      .from('submission_files')
+      .select('*', { count: 'exact', head: true })
+      .eq('process_id', record.id)
+      .eq('obis_code', '2.8.0');
+
+    if (consFileErr || prodFileErr) {
+      const msg = consFileErr?.message ?? prodFileErr?.message;
+      console.warn(`⚠️ submission_files Lookup fehlgeschlagen: ${msg} — verhalte mich wie 'kein Bild vorhanden'.`);
+      collector.warn(`submission_files Lookup fehlgeschlagen: ${msg}`, { process_id: record.id });
     }
-    const hasPictures = (fileCount ?? 0) > 1;
-    console.log(`📷 Bilder vorhanden: ${hasPictures} (count=${fileCount ?? 1})`);
 
-    // Wenn Bilder vorhanden → klassischer Review (Status 9), fertig
-    if (hasPictures) {
-      console.log(`📷 Bilder vorhanden → Status 9 (manueller Review).`);
+    const hasConsPicture = (consPictureCount ?? 0) > 0;
+    const hasProdPicture = (prodPictureCount ?? 0) > 0;
+
+    console.log(`📷 Bilder: cons=${hasConsPicture} (count=${consPictureCount ?? 0}), prod=${hasProdPicture} (count=${prodPictureCount ?? 0})`);
+
+    // Review ist nur dann fällig, wenn JEDER unplausible Wert sein passendes Bild hat.
+    // Fehlt für einen unplausiblen Wert das Bild, läuft die bestehende Logik
+    // (Schleifenschutz, 60-Tage-Check, Wiederholungsprozess) unverändert weiter.
+    const consNeedsPictureAndHasIt = !isConsImplausible || hasConsPicture;
+    const prodNeedsPictureAndHasIt = !isProdImplausible || hasProdPicture;
+    const allImplausibleValuesHavePictures = consNeedsPictureAndHasIt && prodNeedsPictureAndHasIt;
+
+    if (allImplausibleValuesHavePictures) {
+      console.log(`📷 Für alle unplausiblen Werte liegt ein passendes Bild vor → Status 9 (manueller Review).`);
       await supabase.from('Process_Database').update({ kda_status: 9 }).eq('id', record.id);
       await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
       return new Response(
-        JSON.stringify({ success: true, status: 9, branch: 'has_pictures', scores: { cons: consScore, prod: prodScore } }),
+        JSON.stringify({
+          success: true,
+          status: 9,
+          branch: 'has_matching_pictures',
+          scores: { cons: consScore, prod: prodScore },
+          implausible: { cons: isConsImplausible, prod: isProdImplausible },
+        }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }

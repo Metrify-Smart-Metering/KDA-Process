@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { decryptToken } from "../_shared/tokenCrypto.ts"
 
 const JOB_NAME = 'send-kda-reminders'
 // ==========================================
@@ -59,54 +60,57 @@ function parseUtcDate(dateStr: string): Date {
 }
 
 /**
- * Erzeugt einen neuen Token, deaktiviert alte, und speichert ihn mit dem exakten Ablaufdatum.
+ * Holt den bestehenden, noch nicht verbrauchten und noch nicht abgelaufenen
+ * Access-Token für einen Prozess und entschlüsselt ihn, damit derselbe
+ * Magic-Link erneut in einer Reminder-Mail verschickt werden kann.
+ *
+ * WICHTIG: Erzeugt KEINEN neuen Token und invalidiert nichts.
+ * Der Token wurde bereits in send-portal-link angelegt, mit einer
+ * Gültigkeit bis execution_date + second_reminder_interval_days +
+ * days_until_substitute_value + 1 Tag.
  */
-async function createAccessTokenForProcess(
+async function getExistingRawToken(
   supabase: any,
   processId: number,
-  expiresAt: Date,
-): Promise<{ rawToken: string; expiresAtIso: string }> {
-  const nowIso = new Date().toISOString()
-
-  // Vorherige noch offene Tokens für diesen Prozess deaktivieren
-  const { error: invalidateError } = await supabase
+): Promise<{ rawToken: string; expiresAtIso: string } | null> {
+  const { data: tokenRow, error } = await supabase
     .from('access_tokens')
-    .update({ used_at: nowIso })
+    .select('encrypted_token, expires_at, used_at')
+    .eq('process_id', processId)
+    .is('used_at', null)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    throw new Error(`Bestehender Token konnte nicht geladen werden: ${error.message}`)
+  }
+  if (!tokenRow || !tokenRow.encrypted_token) {
+    return null
+  }
+  if (new Date(tokenRow.expires_at) < new Date()) {
+    return null
+  }
+
+  const rawToken = await decryptToken(tokenRow.encrypted_token)
+  return { rawToken, expiresAtIso: tokenRow.expires_at }
+}
+
+/**
+ * Entwertet den noch offenen Token eines Prozesses endgültig.
+ * Wird bei der Schätzwert-Mail (Mail 4) aufgerufen: Spätestens hier
+ * darf der ursprüngliche Link nicht mehr funktionieren.
+ */
+async function invalidateTokenForProcess(supabase: any, processId: number): Promise<void> {
+  const { error } = await supabase
+    .from('access_tokens')
+    .update({ used_at: new Date().toISOString() })
     .eq('process_id', processId)
     .is('used_at', null)
 
-  if (invalidateError) {
-    throw new Error(`Vorherige Tokens konnten nicht deaktiviert werden: ${invalidateError.message}`)
+  if (error) {
+    throw new Error(`Token konnte nicht entwertet werden: ${error.message}`)
   }
-
-  const rawTokenBytes = new Uint8Array(16)
-  crypto.getRandomValues(rawTokenBytes)
-
-  const rawToken = Array.from(rawTokenBytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-
-  const encoder = new TextEncoder()
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(rawToken))
-  const tokenHash = Array.from(new Uint8Array(hashBuffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-
-  const expiresAtIso = expiresAt.toISOString()
-
-  const { error: tokenInsertError } = await supabase
-    .from('access_tokens')
-    .insert({
-      process_id: processId,
-      token_hash: tokenHash,
-      expires_at: expiresAtIso,
-    })
-
-  if (tokenInsertError) {
-    throw new Error(`Neuer Token konnte nicht gespeichert werden: ${tokenInsertError.message}`)
-  }
-
-  return { rawToken, expiresAtIso }
 }
 
 // ==========================================
@@ -239,39 +243,26 @@ Deno.serve(async (req) => {
 
         let mailType: MailType | null = null
         let nextStatus: number | null = null
-        let tokenExpiresAt: Date | null = null
-        let linkValidityDays: number | null = null
 
         // Timing-Logik
+        // Hinweis: Der Access-Token wird NICHT mehr pro Mail neu erzeugt.
+        // Er wurde bereits in send-portal-link angelegt und ist bis
+        // execution_date + secondReminderDays + daysUntilSubstitute + 1 gültig.
         if (currentStatus === 1 && daysSinceExecution >= 0) {
           // First Reminder: Am Tag des Execution Dates
           mailType = 'second_mail'
           nextStatus = 2
-          
-          // Token gültig exakt bis zum zweiten Reminder (execution_date + second_reminder_interval_days)
-          tokenExpiresAt = new Date(executionDateObj.getTime())
-          tokenExpiresAt.setDate(tokenExpiresAt.getDate() + secondReminderDays)
-          
-          linkValidityDays = Math.max(1, secondReminderDays - daysSinceExecution)
-        } 
+        }
         else if (currentStatus === 2 && daysSinceExecution >= secondReminderDays) {
           // Second Reminder: 'second_reminder_interval_days' nach dem Execution Date
           mailType = 'escalation_mail'
           nextStatus = 3
-          
-          // Token gültig exakt bis zur Ersatzwert-Ermittlung (execution_date + second_reminder_interval_days + days_until_substitute_value)
-          tokenExpiresAt = new Date(executionDateObj.getTime())
-          tokenExpiresAt.setDate(tokenExpiresAt.getDate() + secondReminderDays + daysUntilSubstitute)
-          
-          linkValidityDays = Math.max(1, (secondReminderDays + daysUntilSubstitute) - daysSinceExecution)
-        } 
+        }
         else if (currentStatus === 3 && daysSinceExecution >= (secondReminderDays + daysUntilSubstitute)) {
           // Substitute value confirmation mail: 'days_until_substitute_value' + 'second_reminder_interval_days' nach dem Execution Date
           mailType = 'estimated_value_mail'
           nextStatus = 50 // Status 50 = Ersatzwert gebildet / Schätzung abgeschlossen
-          tokenExpiresAt = null // Kein neuer Token notwendig bei Schätz-Bestätigung
-          linkValidityDays = null
-        } 
+        }
         else {
           results.push({
             process_id: processId,
@@ -334,16 +325,23 @@ Deno.serve(async (req) => {
           throw new Error(`Keine out_email für customer_label "${customerLabel}" vorhanden.`)
         }
 
-        // 6. Token erzeugen und in DB abspeichern (falls ein neuer benötigt wird)
+        // 6. Bestehenden Token wiederverwenden (second_mail / escalation_mail)
+        // bzw. Token entwerten (estimated_value_mail). Es wird NIE ein neuer
+        // Token erzeugt und NIE ein Token vorzeitig invalidiert.
         let magicLink: string | null = null
-        if (tokenExpiresAt !== null) {
-          const { rawToken } = await createAccessTokenForProcess(
-            supabase,
-            processId,
-            tokenExpiresAt,
-          )
-          magicLink = `${portalUrl}?id=${processId}&t=${rawToken}`
-          console.log(`[Token] Neuer Token für Prozess ${processId} generiert. Gültig bis ${tokenExpiresAt.toISOString()}`);
+        let linkValidityDays: number | null = null
+
+        if (mailType === 'second_mail' || mailType === 'escalation_mail') {
+          const existing = await getExistingRawToken(supabase, processId)
+          if (!existing) {
+            throw new Error(`Kein gültiger, unbenutzter Token für Prozess ${processId} gefunden. Reminder kann nicht verschickt werden.`)
+          }
+          magicLink = `${portalUrl}?id=${processId}&t=${existing.rawToken}`
+
+          const msDiff = new Date(existing.expiresAtIso).getTime() - Date.now()
+          linkValidityDays = Math.max(1, Math.ceil(msDiff / (1000 * 60 * 60 * 24)))
+
+          console.log(`[Token] Bestehender Token für Prozess ${processId} wiederverwendet. Gültig bis ${existing.expiresAtIso} (${linkValidityDays} Tage verbleibend).`)
         }
 
         const executionDateFormatted = executionDate ? formatDateDE(executionDate) : '-'
@@ -398,6 +396,15 @@ Deno.serve(async (req) => {
         if (!sendgridResponse.ok) {
           const errorBody = await sendgridResponse.text()
           throw new Error(`SendGrid API meldet Fehler-Code ${sendgridResponse.status}: ${errorBody}`)
+        }
+
+        // 9.b Bei der Schätzwert-Mail: Token endgültig entwerten.
+        // Wird NACH erfolgreichem Mailversand ausgeführt, damit bei einem
+        // SendGrid-Fehler (siehe oben, wirft bereits vorher) der Token nicht
+        // fälschlich entwertet wird, obwohl die Mail nie ankam.
+        if (mailType === 'estimated_value_mail') {
+          await invalidateTokenForProcess(supabase, processId)
+          console.log(`[Token] Token für Prozess ${processId} anlässlich der Schätzwert-Mail endgültig entwertet.`)
         }
 
         // 10. kda_status im Prozess aktualisieren

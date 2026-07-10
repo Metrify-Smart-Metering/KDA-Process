@@ -132,7 +132,12 @@ Deno.serve(async (req) => {
 
     if (!normalizedStoredPlz || normalizedInputPlz !== normalizedStoredPlz) {
       return new Response(
-        JSON.stringify({ error: 'Die eingegebene Postleitzahl ist ungueltig.' }),
+        JSON.stringify({ 
+          error: 'Die eingegebene Postleitzahl ist ungueltig.',
+          customer_label: processData.customer_label ?? null,
+        
+        }),
+        
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }

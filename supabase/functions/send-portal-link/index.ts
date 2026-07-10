@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { encryptToken } from "../_shared/tokenCrypto.ts"
 
 const JOB_NAME = 'send-portal-link'
 
@@ -155,24 +156,43 @@ Deno.serve(async (req) => {
       throw new Error(`Für customer_label "${customerLabel}" ist keine out_email gepflegt.`);
     }
 
-    // 3. Trigger_Config laden (für Begründungstext)
+    // 3. Trigger_Config laden (Begründungstext + Reminder-Intervalle für Token-Gültigkeit)
     let kdaReason = DEFAULT_KDA_REASON;
+    let secondReminderDays: number | null = null;
+    let daysUntilSubstitute: number | null = null;
 
-    if (triggerId) {
-      console.log(`[Load] Lade Trigger_Config für trigger_id: '${triggerId}'...`);
-      const { data: configData, error: configError } = await supabase
-        .from('Trigger_Config')
-        .select('reason_text')
-        .eq('id', triggerId)
-        .single();
+    if (!triggerId) {
+      throw new Error(`Für Prozess ${processId} fehlt trigger_id. Token-Gültigkeit kann nicht berechnet werden.`);
+    }
 
-      if (configError) {
-        console.warn(`[Warn] Konnte Trigger_Config für '${triggerId}' nicht laden. Nutze Fallback-Text. Fehler:`, configError.message);
-        collector.warn(`Trigger_Config für '${triggerId}' nicht ladbar, Fallback-Text genutzt: ${configError.message}`, { process_id: processId })
-      } else if (configData?.reason_text) {
-        kdaReason = configData.reason_text;
-        console.log(`[Config] Begründung erfolgreich aus DB geladen.`);
-      }
+    console.log(`[Load] Lade Trigger_Config für trigger_id: '${triggerId}'...`);
+    const { data: configData, error: configError } = await supabase
+      .from('Trigger_Config')
+      .select('reason_text, second_reminder_interval_days, days_until_substitute_value')
+      .eq('id', triggerId)
+      .single();
+
+    if (configError || !configData) {
+      // Kein Fallback hier: Ohne diese Werte kann kein sicheres Ablaufdatum berechnet werden.
+      throw new Error(`Trigger_Config für '${triggerId}' konnte nicht geladen werden: ${configError?.message ?? 'Kein Datensatz gefunden.'}`);
+    }
+
+    if (configData.reason_text) {
+      kdaReason = configData.reason_text;
+    }
+
+    if (configData.second_reminder_interval_days === undefined || configData.second_reminder_interval_days === null) {
+      throw new Error(`Trigger_Config '${triggerId}' hat kein second_reminder_interval_days gesetzt.`);
+    }
+    if (configData.days_until_substitute_value === undefined || configData.days_until_substitute_value === null) {
+      throw new Error(`Trigger_Config '${triggerId}' hat kein days_until_substitute_value gesetzt.`);
+    }
+
+    secondReminderDays = Number(configData.second_reminder_interval_days);
+    daysUntilSubstitute = Number(configData.days_until_substitute_value);
+
+    if (!Number.isFinite(secondReminderDays) || !Number.isFinite(daysUntilSubstitute)) {
+      throw new Error(`Trigger_Config '${triggerId}' enthält ungültige (nicht-numerische) Intervallwerte.`);
     }
 
 
@@ -190,7 +210,11 @@ Deno.serve(async (req) => {
       .map(b => b.toString(16).padStart(2, '0'))
       .join('');
 
-    // 5. Ablesedatum prüfen & formatieren
+    // 5.b Token zusätzlich reversibel verschlüsseln, damit Reminder-Mails
+    // denselben Link erneut verschicken können.
+    const encryptedToken = await encryptToken(rawToken);
+
+    // 5.c Ablesedatum prüfen & formatieren
     const executionDateRaw = record.execution_date;
     if (!executionDateRaw) {
       throw new Error(`Für Prozess ${processId} fehlt execution_date.`);
@@ -202,14 +226,29 @@ Deno.serve(async (req) => {
       year: 'numeric',
     }).format(new Date(executionDateRaw));
 
-    // 5.5 Ablaufdatum setzen (Gültigkeit exakt bis zum Execution Date)
-    const expiresAt = new Date(executionDateRaw);
+    // 5.5 Ablaufdatum setzen: Token bleibt über alle Reminder-Mails hinweg gültig
+    // und läuft spätestens 1 Tag nach der geplanten Schätzwert-Mail ab.
+    // Berechnung timezone-sicher in UTC, um Tagesverschiebungen zu vermeiden.
+    function parseUtcDate(dateStr: string): Date {
+      const [year, month, day] = dateStr.split('-').map(Number);
+      return new Date(Date.UTC(year, month - 1, day));
+    }
+
+    const executionDateUtc = parseUtcDate(String(executionDateRaw).slice(0, 10));
+    if (Number.isNaN(executionDateUtc.getTime())) {
+      throw new Error(`Für Prozess ${processId} ist execution_date ("${executionDateRaw}") kein gültiges Datum.`);
+    }
+
+    const expiresAt = new Date(executionDateUtc.getTime());
+    expiresAt.setUTCDate(
+      expiresAt.getUTCDate() + secondReminderDays! + daysUntilSubstitute! + 1
+    );
 
     // Dynamisch verbleibende Tage berechnen (für den Platzhalter in der E-Mail, mindestens 1 Tag)
     const msDiff = expiresAt.getTime() - Date.now();
     const linkValidityDays = Math.max(1, Math.ceil(msDiff / (1000 * 60 * 60 * 24)));
 
-    console.log(`[Token] Expires-Date für DB: ${expiresAt.toISOString()} (${linkValidityDays} Tage verbleibend bis zum ${executionDateFormatted})`);
+    console.log(`[Token] Expires-Date für DB: ${expiresAt.toISOString()} (gültig bis execution_date + ${secondReminderDays} + ${daysUntilSubstitute} + 1 Tage, ${linkValidityDays} Tage ab jetzt)`);
 
     // 7. Token in 'access_tokens' speichern
     console.log(`[DB] Speichere Token-Hash für Prozess-ID ${processId}...`);
@@ -218,6 +257,7 @@ Deno.serve(async (req) => {
       .insert({
         process_id: processId,
         token_hash: tokenHash,
+        encrypted_token: encryptedToken,
         expires_at: expiresAt.toISOString()
       });
 
