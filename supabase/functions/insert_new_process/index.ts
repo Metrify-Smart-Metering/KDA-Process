@@ -14,6 +14,13 @@ const corsHeaders = {
 }
 
 // ==========================================
+// TEST-FALLBACK (manuell im Code steuerbar, wie gewuenscht)
+// ==========================================
+// Diesen Block auskommentieren / auf false setzen, sobald die Views
+// echte PII liefern oder wenn produktiv deployed wird.
+const USE_TEST_PII_FALLBACK = true;
+
+// ==========================================
 // CASE-INSENSITIVE FIELD GETTER
 // ==========================================
 /**
@@ -34,14 +41,43 @@ function getField(obj: any, keys: string[]): any {
 }
 
 // ==========================================
+// MELO VALIDATION
+// ==========================================
+// Schuetzt gegen SQL-Injection bei der String-Interpolation unten.
+// Passe das Pattern an das echte Melo-Format an (hier: alphanumerisch, -, _, .).
+const MELO_PATTERN = /^[A-Za-z0-9\-_.]{1,64}$/;
+
+function assertValidMelo(melo: string): void {
+  if (!MELO_PATTERN.test(melo)) {
+    throw new Error(`Ungueltiges Melo-Format, Abbruch aus Sicherheitsgruenden: '${melo}'`);
+  }
+}
+
+// ==========================================
+// PII-ABRUF UEBER DEDIZIERTE SNOWFLAKE-FUNKTION
+// ==========================================
+/**
+ * Ruft PII-Daten (Name, Mail, Anrede, PLZ) ausschliesslich ueber die
+ * Snowflake-Funktion get_customer_pii ab, statt sie in den Trigger-Views
+ * zu speichern. Wird nur genau einmal pro tatsaechlich neu anzulegendem
+ * Prozess aufgerufen. Nutzt echtes Parameter-Binding der Snowflake SQL-API
+ * (kein String-Interpolation-Risiko mehr).
+ */
+async function fetchCustomerPii(melo: string): Promise<any | null> {
+  const query = `
+    SELECT *
+    FROM TABLE( OPERATIONS_SANDBOX.KDA.get_customer_pii(?))
+  `;
+  const rows = await executeSnowflakeQuery('primary', query, {
+    "1": { type: "TEXT", value: melo },
+  });
+  if (!rows || rows.length === 0) return null;
+  return rows[0];
+}
+
+// ==========================================
 // HELPERS
 // ==========================================
-
-/**
- * Normalizes any incoming date value (ISO string, Date, epoch-day int, etc.)
- * to a clean ISO yyyy-mm-dd string. Returns null on failure.
- * Immune to Javascript timezone parsing shifts.
- */
 function toIsoDate(rawVal: any): string | null {
   if (rawVal === undefined || rawVal === null) return null;
 
@@ -104,6 +140,9 @@ Deno.serve(async (req) => {
 
   try {
     console.log("=== insert_new_process Edge Function gestartet ===");
+    if (USE_TEST_PII_FALLBACK) {
+      console.warn("[ACHTUNG] USE_TEST_PII_FALLBACK = true. PII-Test-Ueberschreibung ist aktiv. Nicht in Produktion verwenden!");
+    }
 
     // 1. Webhook Payload sichern und auswerten
     let payload: any = null;
@@ -122,7 +161,7 @@ Deno.serve(async (req) => {
       const status = payload.record?.status;
 
       if (jobName !== 'Select_KDA_Process_From_Trigger' || status !== 'success') {
-        console.log(`[Pipeline] Ignoriere Event für Job '${jobName}' mit Status '${status}'.`);
+        console.log(`[Pipeline] Ignoriere Event fuer Job '${jobName}' mit Status '${status}'.`);
         return new Response(JSON.stringify({ message: "Ignoriert", success: true }), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
           status: 200
@@ -176,7 +215,7 @@ Deno.serve(async (req) => {
     if (backlogErr || !acceptedBacklog) {
       throw new Error(`Trigger_Backlog konnte nicht geladen werden: ${backlogErr?.message}`);
     }
-    console.log(`[Load] ${acceptedBacklog.length} accepted Backlog-Einträge insgesamt in DB gefunden.`);
+    console.log(`[Load] ${acceptedBacklog.length} accepted Backlog-Eintraege insgesamt in DB gefunden.`);
 
     // Performance-Optimierung: Nur unverarbeitete (noch keine process_created extra_info) im Speicher filtern
     const unprocessedBacklog = acceptedBacklog.filter(r => {
@@ -186,8 +225,7 @@ Deno.serve(async (req) => {
     console.log(`[Load] ${unprocessedBacklog.length} davon sind neu und unverarbeitet.`);
 
     if (unprocessedBacklog.length === 0) {
-      // Auch hier: Melde trotzdem Erfolg, damit der Pipeline-Lauf im Log vollständig ist!
-      console.log("[Pipeline] Keine neuen accepted Backlog-Einträge. Melde Erfolg an pipeline_control...");
+      console.log("[Pipeline] Keine neuen accepted Backlog-Eintraege. Melde Erfolg an pipeline_control...");
       await logPipelineRun(supabase, {
         jobName: JOB_NAME,
         status: 'success',
@@ -196,14 +234,14 @@ Deno.serve(async (req) => {
       })
       return new Response(JSON.stringify({
         success: true,
-        message: "Keine unverarbeiteten accepted Backlog-Einträge zu verarbeiten."
+        message: "Keine unverarbeiteten accepted Backlog-Eintraege zu verarbeiten."
       }), { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 });
     }
 
     // 5. Laufende/Bestehende Prozesse laden, um Doppel-Kreation zu verhindern
     const melos = unprocessedBacklog.map(r => String(getField(r, ['Melo', 'melo']) ?? '').trim()).filter(Boolean);
-    console.log(`[Load] Prüfe bestehende Prozesse für ${melos.length} Melos...`);
-    
+    console.log(`[Load] Pruefe bestehende Prozesse fuer ${melos.length} Melos...`);
+
     let existingProcs: any[] = [];
     {
       const { data: procData, error: procErr } = await supabase
@@ -217,7 +255,7 @@ Deno.serve(async (req) => {
           )
         `)
         .in('Customer_PII.melo', melos);
-      
+
       if (procErr) {
         console.warn(`[Warn] Bestehende Prozesse konnten nicht geladen werden: ${procErr.message}`);
         collector.warn(`Bestehende Prozesse konnten nicht geladen werden: ${procErr.message}`)
@@ -261,7 +299,7 @@ Deno.serve(async (req) => {
       console.log(`--- Verarbeite accepted Kandidat ID: ${recId} (Melo: ${melo}, Type: ${triggerType}) ---`);
 
       if (!melo || !exDate) {
-        console.warn(`[Skip] Ungültiger Datensatz: Melo oder Ex_Date fehlt.`);
+        console.warn(`[Skip] Ungueltiger Datensatz: Melo oder Ex_Date fehlt.`);
         countFailed++;
         continue;
       }
@@ -269,8 +307,8 @@ Deno.serve(async (req) => {
       // Check auf Doppel-Kreierung
       const procKey = `${melo.toLowerCase()}_${exDate}`;
       if (existingProcSet.has(procKey)) {
-        console.log(`[Already-Processed] Ein Prozess für Melo ${melo} am ${exDate} existiert bereits.`);
-        
+        console.log(`[Already-Processed] Ein Prozess fuer Melo ${melo} am ${exDate} existiert bereits.`);
+
         // Update extra_info im Backlog als Audit-Spur
         await supabase
           .from('Trigger_Backlog')
@@ -284,41 +322,43 @@ Deno.serve(async (req) => {
       // Config für den Trigger-Typ laden
       const cfg = configMap.get(triggerType);
       if (!cfg) {
-        console.warn(`[Skip] Keine Trigger-Config für Typ '${triggerType}' gefunden.`);
+        console.warn(`[Skip] Keine Trigger-Config fuer Typ '${triggerType}' gefunden.`);
         countFailed++;
         continue;
       }
 
       const viewName = cfg.snowflake_view_name;
       if (!viewName) {
-        console.warn(`[Skip] Keine Snowflake-View für Typ '${triggerType}' konfiguriert.`);
+        console.warn(`[Skip] Keine Snowflake-View fuer Typ '${triggerType}' konfiguriert.`);
         countFailed++;
         continue;
       }
 
-      // 7. Snowflake Abfrage für die PII- und Prozessdaten dieser Melo ausführen
-      console.log(`[Snowflake] Abfrage auf View '${viewName}' für Melo '${melo}'...`);
+      // 7. Snowflake Abfrage fuer die operativen Daten dieser Melo (echtes Binding statt String-Interpolation)
+      console.log(`[Snowflake] Abfrage auf View '${viewName}' fuer Melo '${melo}'...`);
       let customerRow: any = null;
       try {
+        // Hinweis: viewName kommt aus Trigger_Config (interne Konfig, kein User-Input),
+        // wird daher weiterhin direkt in die Query eingesetzt. melo kommt ueber Binding.
         const query = `
-          SELECT * 
-          FROM ${viewName} 
-          WHERE TRIM(LOWER(melo)) = TRIM(LOWER('${melo}'))
+          SELECT *
+          FROM ${viewName}
+          WHERE TRIM(LOWER(melo)) = TRIM(LOWER(?))
         `;
-        const rows = await executeSnowflakeQuery('primary', query);
-        console.log(`[Snowflake] ${rows.length} Zeilen zurückgegeben.`);
+        const rows = await executeSnowflakeQuery('primary', query, {
+          "1": { type: "TEXT", value: melo },
+        });
+        console.log(`[Snowflake] ${rows.length} Zeilen zurueckgegeben.`);
 
-        // Passende Zeile anhand des Org_Exe_Date ermitteln
         if (rows.length > 0) {
           customerRow = rows.find(r => {
             const rowDate = toIsoDate(getField(r, ['org_exe_date', 'execution_date', 'source_event_date']));
             return rowDate === orgExeDate;
           });
 
-          // Fallback: Erste Zeile nehmen, falls kein exaktes Datums-Match vorhanden ist
           if (!customerRow) {
             customerRow = rows[0];
-            console.log(`[Snowflake] Kein exaktes Datums-Match für ${orgExeDate}. Nutze erste Zeile als Fallback.`);
+            console.log(`[Snowflake] Kein exaktes Datums-Match fuer ${orgExeDate}. Nutze erste Zeile als Fallback.`);
           }
         }
       } catch (err) {
@@ -326,34 +366,13 @@ Deno.serve(async (req) => {
         collector.error(`Snowflake-View '${viewName}' fehlgeschlagen: ${err.message}`, { melo, trigger_candidate_id: recId })
       }
 
-      // Echte PII Felder aus der View (sobald sie verfügbar sind)
-      let customerMail        = getField(customerRow, ['customer_mail', 'customer_email', 'mail', 'email']);
-      let customerFirstName   = getField(customerRow, ['customer_f_name', 'customer_first_name', 'first_name', 'f_name']);
-      let customerLastName    = getField(customerRow, ['customer_l_name', 'customer_last_name', 'last_name', 'l_name']);
-      let customerSalutation  = getField(customerRow, ['customer_salutation', 'salutation', 'anrede']);
-      const meterNumber       = getField(customerRow, ['meter_number', 'zaehlernummer', 'meter', 'meter_no']);
-      let customerPlz         = getField(customerRow, ['customer_plz', 'plz', 'zip', 'postcode', 'zip_code']);
-      const customerLabel     = getField(customerRow, ['customer_label', 'brand_key', 'brand']);
-
-      // =====================================================================
-      // >>> TEST-FALLBACK: PII mit Dummy-Daten ueberschreiben <<
-      // Diesen Block auskommentieren, sobald die Views echte PII liefern.
-      // ---------------------------------------------------------------------
-      const USE_TEST_PII_FALLBACK = false;
-      if (USE_TEST_PII_FALLBACK) {
-        customerFirstName  = 'Erik';
-        customerLastName   = 'Beiersdorf';
-        customerPlz        = '22395';
-        customerMail       = 'erik.beiersdorf@enpal.de';
-        customerSalutation = customerSalutation ?? 'Herr';
-        console.log('[Test-Mode] PII mit Dummy-Daten (Erik Beiersdorf) ueberschrieben.');
-      }
-      // <<< Ende Test-Fallback >>>
-      // =====================================================================
-
+      // Nur operative Felder aus der View lesen. customer_label kommt
+      // jetzt ausschliesslich aus get_customer_pii(). meter_number bleibt
+      // primaer aus der View (hoehere Prioritaet), wird aber unten gegen
+      // den Wert aus der PII-Function abgeglichen.
+      const meterNumberFromView = getField(customerRow, ['meter_number', 'zaehlernummer', 'meter', 'meter_no']);
 
       // 7. Zählerstände robust als JSONB parsen oder generieren
-
       // --- Verbrauch (Bezug / OBIS 1.8.0) ---
       let lastConsReading = null;
       const rawCons = getField(customerRow, ['last_cons_reading']);
@@ -376,7 +395,7 @@ Deno.serve(async (req) => {
             value: Number(consVal)
           };
         }
-      }
+      }customerRow
 
       // --- Einspeisung (OBIS 2.8.0) ---
       let lastProdReading = null;
@@ -404,9 +423,109 @@ Deno.serve(async (req) => {
 
       console.log(`[Readings] cons=${JSON.stringify(lastConsReading)} prod=${JSON.stringify(lastProdReading)}`);
 
+      // 8. PII laden - genau einmal, direkt vor dem Anlegen des Prozesses
+      console.log(`[Snowflake] Lade PII fuer Melo '${melo}' ueber get_customer_pii()...`);
+      let piiRow: any = null;
+      try {
+        piiRow = await fetchCustomerPii(melo);
+      } catch (err) {
+        console.error(`[Snowflake-Fehler] PII-Abruf fuer Melo '${melo}' fehlgeschlagen:`, err.message);
+        collector.error(`PII-Abruf fehlgeschlagen: ${err.message}`, { melo, trigger_candidate_id: recId })
+      }
 
-      // 8. DB TRANSACTION: Customer_PII & Process_Database einfügen
-      console.log(`[DB] Erstelle neuen Customer_PII Datensatz für Melo ${melo}...`);
+      let customerMail: any        = getField(piiRow, ['customer_mail', 'customer_email', 'mail', 'email']);
+      let customerFirstName: any   = getField(piiRow, ['customer_f_name', 'customer_first_name', 'first_name', 'f_name']);
+      let customerLastName: any    = getField(piiRow, ['customer_l_name', 'customer_last_name', 'last_name', 'l_name']);
+      let customerSalutation: any  = getField(piiRow, ['customer_salutation', 'salutation', 'anrede']);
+      let customerPlz: any         = getField(piiRow, ['customer_plz', 'plz', 'zip', 'postcode', 'zip_code']);
+      const customerLabel: any       = getField(piiRow, ['customer_label', 'brand_key', 'brand']);
+      const meterNumberFromPii: any  = getField(piiRow, ['meter_number', 'zaehlernummer', 'meter', 'meter_no']);
+
+      // meter_number: View hat Prioritaet. Falls PII-Function einen
+      // abweichenden Wert liefert, wird das als Warnung dokumentiert,
+      // blockiert den Prozess aber nicht.
+
+      const meterNumber = meterNumberFromView;
+      if (
+        meterNumberFromView &&
+        meterNumberFromPii &&
+        String(meterNumberFromView).trim() !== String(meterNumberFromPii).trim()
+      ) {
+        console.warn(
+          `[Warn] meter_number weicht ab fuer Melo ${melo}: View='${meterNumberFromView}' vs. PII-Function='${meterNumberFromPii}'. Nutze View-Wert.`
+        );
+        collector.warn(
+          `meter_number-Abweichung fuer Melo ${melo}: View='${meterNumberFromView}' vs. PII-Function='${meterNumberFromPii}'. View-Wert wurde verwendet.`,
+          { melo, trigger_candidate_id: recId }
+        );
+      }
+
+      // =====================================================================
+      // >>> TEST-FALLBACK: PII mit View-Daten oder Dummy-Daten ueberschreiben <<<
+      // Diesen Block auskommentieren bzw. USE_TEST_PII_FALLBACK auf false
+      // setzen, sobald produktiv getestet wird.
+      //
+      // Reihenfolge: Falls die View selbst PII-Felder mitliefert (gleiche
+      // Feldnamen wie die echten PII-Felder: customer_mail, customer_f_name,
+      // customer_l_name, customer_salutation, customer_plz), werden diese
+      // genutzt. Fehlt ein Feld in der View, wird auf den Dummy-Wert
+      // zurueckgefallen.
+      //
+      // ACHTUNG: USE_TEST_PII_FALLBACK muss vor jedem Produktiv-Deploy
+      // zwingend auf false stehen, da die View sonst versehentlich echte
+      // Kundendaten unter denselben Feldnamen liefern und automatisch
+      // verwendet werden koennte.
+      // ---------------------------------------------------------------------
+      if (USE_TEST_PII_FALLBACK) {
+        const viewMail        = getField(customerRow, ['customer_mail', 'customer_email', 'mail', 'email']);
+        const viewFirstName   = getField(customerRow, ['customer_f_name', 'customer_first_name', 'first_name', 'f_name']);
+        const viewLastName    = getField(customerRow, ['customer_l_name', 'customer_last_name', 'last_name', 'l_name']);
+        const viewSalutation  = getField(customerRow, ['customer_salutation', 'salutation', 'anrede']);
+        const viewPlz         = getField(customerRow, ['customer_plz', 'plz', 'zip', 'postcode', 'zip_code']);
+
+        customerMail        = viewMail        ?? 'erik.beiersdorf@enpal.de';
+        customerFirstName   = viewFirstName   ?? 'Erik';
+        customerLastName    = viewLastName    ?? 'Beiersdorf';
+        customerPlz         = viewPlz         ?? '22395';
+        customerSalutation  = viewSalutation  ?? customerSalutation ?? 'Herr';
+
+        console.log(
+          `[Test-Mode] PII fuer Melo ${melo} ueberschrieben. Quelle je Feld: ` +
+          `mail=${viewMail ? 'View' : 'Dummy'}, ` +
+          `firstName=${viewFirstName ? 'View' : 'Dummy'}, ` +
+          `lastName=${viewLastName ? 'View' : 'Dummy'}, ` +
+          `plz=${viewPlz ? 'View' : 'Dummy'}, ` +
+          `salutation=${viewSalutation ? 'View' : 'Dummy/Original'}`
+        );
+      }
+      // <<< Ende Test-Fallback >>>
+      // =====================================================================
+
+      // Mail und PLZ sind Pflichtfelder: ohne sie kann weder der Mailversand
+      // noch die Verifikation funktionieren. Fehlt eines davon (oder wurde
+      // gar keine PII gefunden), wird der Prozess NICHT angelegt, aber der
+      // Grund wird dokumentiert, damit er in den Reports sichtbar ist.
+      const missingReasons: string[] = [];
+      if (!piiRow) missingReasons.push('keine PII-Daten in customer_register gefunden');
+      if (!customerMail) missingReasons.push('E-Mail-Adresse fehlt');
+      if (!customerPlz) missingReasons.push('PLZ fehlt');
+
+      if (missingReasons.length > 0) {
+        const reasonText = missingReasons.join('; ');
+        console.warn(`[Skip] Melo '${melo}': ${reasonText}. Prozess wird nicht angelegt.`);
+        collector.error(`Prozess fuer Melo ${melo} nicht angelegt: ${reasonText}.`, { melo, trigger_candidate_id: recId })
+
+        await supabase
+          .from('Trigger_Backlog')
+          .update({ extra_info: `process_blocked: ${reasonText}` })
+          .eq('Trigger_Candidate_ID', recId);
+
+        countFailed++;
+        continue;
+      }
+
+      // 9. DB TRANSACTION: Customer_PII & Process_Database einfuegen
+      console.log(`[DB] Erstelle neuen Customer_PII Datensatz fuer Melo ${melo}...`);
       const { data: piiInserted, error: piiInsertErr } = await supabase
         .from('Customer_PII')
         .insert({
@@ -461,8 +580,8 @@ Deno.serve(async (req) => {
         .eq('Trigger_Candidate_ID', recId);
 
       if (backlogUpdateErr) {
-        console.warn(`[Warn] Backlog ID ${recId} konnte nicht mit der Prozess-ID verknüpft werden:`, backlogUpdateErr.message);
-        collector.warn(`Backlog ID ${recId} konnte nicht mit Prozess-ID verknüpft werden: ${backlogUpdateErr.message}`)
+        console.warn(`[Warn] Backlog ID ${recId} konnte nicht mit der Prozess-ID verknuepft werden:`, backlogUpdateErr.message);
+        collector.warn(`Backlog ID ${recId} konnte nicht mit Prozess-ID verknuepft werden: ${backlogUpdateErr.message}`)
       }
 
       // Registriere im Speicher für nachfolgende Iterationen im selben Lauf

@@ -83,8 +83,6 @@ Deno.serve(async (req) => {
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
-// 6. Stammdaten (MeLo & Zählernummer) über Customer_PII Relation laden
-
     // 6. Stammdaten (MeLo & Zählernummer) über Customer_PII Relation laden
     console.log(`💾 Frage Stammdaten aus Postgres ab für Process-ID: ${record.id}...`);
     const { data: processData, error: processError } = await supabase
@@ -220,21 +218,6 @@ Deno.serve(async (req) => {
       console.log("ℹ️ Keine Werte zum Validieren vorhanden (weder cons_val noch prod_val übergeben).");
     }
 
-    // Scores in Process_Database persistieren, unabhängig vom weiteren Ausgang.
-    // Das schafft eine nachvollziehbare Historie, welcher Wert wie bewertet wurde.
-    const { error: scoreUpdateError } = await supabase
-      .from('Process_Database')
-      .update({
-        cons_plausibility_score: consScore,
-        prod_plausibility_score: prodScore,
-      })
-      .eq('id', record.id);
-
-    if (scoreUpdateError) {
-      console.warn(`⚠️ Plausibilitäts-Scores konnten nicht gespeichert werden: ${scoreUpdateError.message}`);
-      collector.warn(`Plausibilitäts-Scores konnten nicht gespeichert werden: ${scoreUpdateError.message}`, { process_id: record.id });
-    }
-
     // 9. Finale Auswertung & Entscheidung — cons und prod bleiben bewusst getrennt,
     // damit wir später wissen, WELCHER Wert unplausibel war (nicht nur "irgendetwas").
     const isConsImplausible = (record.cons_val !== undefined && record.cons_val !== null)
@@ -245,7 +228,25 @@ Deno.serve(async (req) => {
       : false;
 
     const isPlausible = !isConsImplausible && !isProdImplausible;
-    const nextStatus = isPlausible ? 100 : 9; // Platzhalter, wird unten in Fall B ggf. überschrieben
+
+    // Scores UND die daraus abgeleitete Implausibilitäts-Entscheidung persistieren.
+    // Das ist die EINZIGE Stelle im System, an der der 33.4%-Schwellenwert
+    // ausgewertet wird. Views/Reports lesen ab hier nur noch cons_implausible /
+    // prod_implausible, nie mehr die Rohwerte gegen einen eigenen Grenzwert.
+    const { error: scoreUpdateError } = await supabase
+      .from('Process_Database')
+      .update({
+        cons_plausibility_score: consScore,
+        prod_plausibility_score: prodScore,
+        cons_implausible: isConsImplausible,
+        prod_implausible: isProdImplausible,
+      })
+      .eq('id', record.id);
+
+    if (scoreUpdateError) {
+      console.warn(`⚠️ Plausibilitäts-Scores konnten nicht gespeichert werden: ${scoreUpdateError.message}`);
+      collector.warn(`Plausibilitäts-Scores konnten nicht gespeichert werden: ${scoreUpdateError.message}`, { process_id: record.id });
+    }
 
     // ============================================================
     // FALL A: PLAUSIBEL → Status 100, fertig
