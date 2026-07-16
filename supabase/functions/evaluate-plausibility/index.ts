@@ -83,7 +83,7 @@ Deno.serve(async (req) => {
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
-    // 6. Stammdaten (MeLo & Zählernummer) über Customer_PII Relation laden
+    // 4. Stammdaten (MeLo & Zählernummer) über Customer_PII Relation laden
     console.log(`💾 Frage Stammdaten aus Postgres ab für Process-ID: ${record.id}...`);
     const { data: processData, error: processError } = await supabase
       .from('Process_Database')
@@ -142,20 +142,21 @@ Deno.serve(async (req) => {
 
     // ---------- 5. Snowflake-Plausibilitätscheck ----------
     const runPlausibilityCheck = async (obisCode: string, rawVal: any, label: string) => {
-      const val = parseFloat(String(rawVal));
-      if (isNaN(val)) {
+      const num = Number(String(rawVal).trim().replace(',', '.'));
+      if (!Number.isFinite(num)) {
         console.warn(`⚠️ [Helper] Wert für ${label} (${rawVal}) ist keine gültige Zahl.`);
         return { score: 0, isSuspicious: false };
       }
+      const valInt = Math.round(num);
 
-      console.log(`❄️ [Snowflake Helper] Starte Abfrage für ${label} (${obisCode}): ${val} kWh`);
+      console.log(`❄️ [Snowflake Helper] Starte Abfrage für ${label} (${obisCode}): ${valInt} kWh`);
       const sql = `CALL OPERATIONS_SANDBOX.KDA.EVALUATE_KDA_READING(?, ?, ?, ?, ?)`;
       const snowflakeResult = await executeSnowflakeQuery('primary', sql, {
         "1": { type: "TEXT", value: String(melo) },
         "2": { type: "TEXT", value: String(meterNumber) },
         "3": { type: "TEXT", value: String(readingDate) },
         "4": { type: "TEXT", value: obisCode },
-        "5": { type: "TEXT", value: String(val) }
+        "5": { type: "TEXT", value: String(valInt) }
       });
 
       console.log(`❄️ [Snowflake Helper] Antwort erhalten für ${obisCode}:`, JSON.stringify(snowflakeResult));
@@ -173,50 +174,35 @@ Deno.serve(async (req) => {
       }
     };
 
-    const evaluationPromises: Promise<{ type: 'cons' | 'prod', score: number, isSuspicious: boolean }>[] = [];
-
-    // Bezugswert-Prüfung (1.8.0) registrieren
-    if (record.cons_val !== undefined && record.cons_val !== null) {
-      evaluationPromises.push(
-        runPlausibilityCheck('1-0:1.8.0', record.cons_val, 'Bezugswert (1.8.0)').then(res => ({
-          type: 'cons',
-          ...res
-        }))
-      );
-    }
-
-    // Einspeisewert-Prüfung (2.8.0) registrieren
-    if (record.prod_val !== undefined && record.prod_val !== null) {
-      evaluationPromises.push(
-        runPlausibilityCheck('1-0:2.8.0', record.prod_val, 'Einspeisewert (2.8.0)').then(res => ({
-          type: 'prod',
-          ...res
-        }))
-      );
-    }
-
+    
     let consScore = 100;
     let prodScore = 100;
     let consSuspicious = false;
     let prodSuspicious = false;
 
-    if (evaluationPromises.length > 0) {
-      console.log(`⚡ [Promise.all] Starte ${evaluationPromises.length} Snowflake-Abfragen parallel...`);
-      const results = await Promise.all(evaluationPromises);
-      console.log("⚡ [Promise.all] Alle parallelen Abfragen erfolgreich abgeschlossen!");
+    // --- Serielle Snowflake-Abfragen (stabiler als Promise.all) ---
+    if (record.cons_val !== undefined && record.cons_val !== null) {
+      console.log("➡️ Starte cons Plausibility Check (seriell)...");
+      const res = await runPlausibilityCheck('1-0:1.8.0', record.cons_val, 'Bezugswert (1.8.0)');
+      consScore = res.score;
+      consSuspicious = res.isSuspicious;
+    }
 
-      for (const res of results) {
-        if (res.type === 'cons') {
-          consScore = res.score;
-          consSuspicious = res.isSuspicious;
-        } else if (res.type === 'prod') {
-          prodScore = res.score;
-          prodSuspicious = res.isSuspicious;
-        }
-      }
-    } else {
+    if (record.prod_val !== undefined && record.prod_val !== null) {
+      console.log("➡️ Starte prod Plausibility Check (seriell)...");
+      const res = await runPlausibilityCheck('1-0:2.8.0', record.prod_val, 'Einspeisewert (2.8.0)');
+      prodScore = res.score;
+      prodSuspicious = res.isSuspicious;
+    }
+
+    if (
+      (record.cons_val === undefined || record.cons_val === null) &&
+      (record.prod_val === undefined || record.prod_val === null)
+    ) {
       console.log("ℹ️ Keine Werte zum Validieren vorhanden (weder cons_val noch prod_val übergeben).");
     }
+
+
 
     // 9. Finale Auswertung & Entscheidung — cons und prod bleiben bewusst getrennt,
     // damit wir später wissen, WELCHER Wert unplausibel war (nicht nur "irgendetwas").

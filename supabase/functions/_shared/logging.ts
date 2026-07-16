@@ -222,3 +222,84 @@ export async function logPipelineRun(
     await sendTeamsAlert(jobName, fatalErrorMessage)
   }
 }
+
+// ==========================================
+// NOTFALL-LOGGING OHNE SUPABASE-CLIENT
+// Wird nur genutzt, wenn der Supabase-Client selbst nicht gebaut
+// werden konnte. Schreibt per rohem REST-Call direkt in
+// pipeline_control und loest sofort einen Teams-Alarm aus.
+// ==========================================
+export async function logStartupFailureWithoutSupabase(
+  jobName: string,
+  errorMessage: string
+): Promise<void> {
+  const supabaseUrl = Deno.env.get('SUPABASE_URL')
+  const serviceKey =
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ??
+    Deno.env.get('SUPABASE_SECRET_KEY')
+
+  if (supabaseUrl && serviceKey) {
+    try {
+      await fetch(`${supabaseUrl}/rest/v1/pipeline_control`, {
+        method: 'POST',
+        headers: {
+          'apikey': serviceKey,
+          'Authorization': `Bearer ${serviceKey}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          job_name: jobName,
+          status: 'error',
+          error_message: `Startup-Fehler (kein Supabase-Client): ${errorMessage}`,
+          errors: [],
+          finished_at: new Date().toISOString()
+        })
+      })
+    } catch (err) {
+      console.error('[Notfall-Logging-Fehler] Konnte pipeline_control nicht per REST beschreiben:', err)
+    }
+  } else {
+    console.error('[Notfall-Logging] Keine SUPABASE_URL/Key vorhanden - kann nicht mal per REST loggen.')
+  }
+
+  // Teams-Alarm unabhaengig vom Supabase-Log versuchen
+  await sendStartupTeamsAlert(jobName, errorMessage)
+}
+
+// Kleine eigene Alert-Funktion, falls sendTeamsAlert nicht exportiert ist -
+// alternativ die bestehende sendTeamsAlert-Funktion exportieren und wiederverwenden.
+async function sendStartupTeamsAlert(jobName: string, errorMessage: string): Promise<void> {
+  const alertsWebhookUrl = Deno.env.get('TEAMS_ALERTS_WEBHOOK_URL')
+  if (!alertsWebhookUrl) return
+
+  try {
+    await fetch(alertsWebhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: "message",
+        attachments: [{
+          contentType: "application/vnd.microsoft.card.adaptive",
+          content: {
+            type: "AdaptiveCard",
+            version: "1.2",
+            body: [{
+              type: "TextBlock",
+              text: `🔴 KDA Startup-Fehler: ${jobName}`,
+              weight: "Bolder",
+              wrap: true
+            }, {
+              type: "TextBlock",
+              text: errorMessage,
+              wrap: true
+            }],
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json"
+          }
+        }]
+      })
+    })
+  } catch (err) {
+    console.error('[Alert-Fehler] Startup-Teams-Alarm fehlgeschlagen:', err)
+  }
+}

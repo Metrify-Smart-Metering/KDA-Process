@@ -64,15 +64,21 @@ function assertValidMelo(melo: string): void {
  * (kein String-Interpolation-Risiko mehr).
  */
 async function fetchCustomerPii(melo: string): Promise<any | null> {
+  assertValidMelo(melo);
   const query = `
     SELECT *
-    FROM TABLE( OPERATIONS_SANDBOX.KDA.get_customer_pii(?))
+    FROM TABLE(
+      OPERATIONS_SANDBOX.KDA.GET_CUSTOMER_PII(CAST(? AS VARCHAR))
+    )
   `;
+  console.log('[PII SQL]', JSON.stringify(query));
   const rows = await executeSnowflakeQuery('primary', query, {
-    "1": { type: "TEXT", value: melo },
+    "1": {
+      type: "TEXT",
+      value: melo,
+    },
   });
-  if (!rows || rows.length === 0) return null;
-  return rows[0];
+  return rows?.[0] ?? null;
 }
 
 // ==========================================
