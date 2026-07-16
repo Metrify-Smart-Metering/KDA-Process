@@ -3,7 +3,9 @@
 > Automatisierter Backend-Workflow für die Auswahl, Eröffnung, Bearbeitung und Auswertung von KDA-Prozessen rund um Zählerstände.
 
 Das Projekt besteht aus **Supabase Edge Functions**, die Trigger-Daten aus **Snowflake** übernehmen, KDA-Fälle in **Supabase/PostgreSQL** verwalten, Kundinnen und Kunden über **SendGrid** kontaktieren, Zählerstände und Belegbilder entgegennehmen, Werte auf Plausibilität prüfen und Ergebnisse an **Microsoft Teams**, **Power Automate** und Snowflake weitergeben.
-
+## Wichtige Links
+- Git von dem Frontend: https://github.com/Metrify-Smart-Metering/kda-portal
+- Miro: https://miro.com/app/board/uXjVGqfVpFA=/?share_link_id=126216699187
 
 ## Inhaltsverzeichnis
 
