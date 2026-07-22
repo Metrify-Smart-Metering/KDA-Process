@@ -11,6 +11,8 @@ const corsHeaders = {
 }
 
 const JOB_NAME = 'send-weekly-kda-report'
+const CSV_BUCKET = 'kda_upload_csv'
+const SIGNED_URL_TTL_SECONDS = 60 * 60 // 60 Minuten
 
 // ==========================================
 // HELPERS
@@ -181,6 +183,59 @@ Deno.serve(async (req) => {
 
     const acceptedCsv = buildCsv(acceptedCsvRows)
 
+    const jobId = crypto.randomUUID()
+    const reportDateIso = new Date().toISOString().slice(0, 10)
+
+    let acceptedFile: {
+      bucket: string
+      path: string
+      file_name: string
+      download_url: string
+    } | null = null
+
+    if (acceptedCsvRows.length > 0) {
+      const fileName = `accepted_${reportDateIso}.csv`
+      const storagePath = `${reportDateIso}/${jobId}/${fileName}`
+
+      // UTF-8 BOM hilft Excel bei Umlauten und Sonderzeichen
+      const csvBytes = new TextEncoder().encode(`\uFEFF${acceptedCsv}`)
+
+      const { error: uploadError } = await supabase.storage
+        .from(CSV_BUCKET)
+        .upload(storagePath, csvBytes, {
+          contentType: 'text/csv; charset=utf-8',
+          upsert: false
+        })
+
+      if (uploadError) {
+        throw new Error(
+          `Accepted-CSV konnte nicht in Supabase Storage hochgeladen werden: ${uploadError.message}`
+        )
+      }
+
+      const { data: signedUrlData, error: signedUrlError } =
+        await supabase.storage
+          .from(CSV_BUCKET)
+          .createSignedUrl(storagePath, SIGNED_URL_TTL_SECONDS)
+
+      if (signedUrlError || !signedUrlData?.signedUrl) {
+        throw new Error(
+          `Signed URL konnte nicht erstellt werden: ${
+            signedUrlError?.message ?? 'Keine URL zurückgegeben'
+          }`
+        )
+      }
+
+      acceptedFile = {
+        bucket: CSV_BUCKET,
+        path: storagePath,
+        file_name: fileName,
+        download_url: signedUrlData.signedUrl
+      }
+
+      console.log(`[Storage] Accepted-CSV hochgeladen: ${storagePath}`)
+    }
+
     // Estimated-Faelle bleiben als einfache Objektliste (kein CSV, kein Base64)
     const estimatedCases = (estimatedRows ?? []).map(r => ({
       process_id: r.id,
@@ -195,82 +250,131 @@ Deno.serve(async (req) => {
 
     // 6. An Power Automate senden
     const payload = {
-      secret: reportWebhookSecret,
-      report_date: uploadDate,
-      accepted_csv_base64: btoa(unescape(encodeURIComponent(acceptedCsv))),
-      accepted_count: acceptedRows?.length ?? 0,
-      estimated_cases: estimatedCases,
-      estimated_count: estimatedCases.length,
-      manual_review_process_ids: (manualCases ?? []).map(c => c.id)
-    }
+    secret: reportWebhookSecret,
+    job_id: jobId,
+    report_date: uploadDate,
+
+    accepted_file: acceptedFile,
+    accepted_count: acceptedRows?.length ?? 0,
+    accepted_process_ids: (acceptedRows ?? []).map(r => r.id),
+
+    estimated_cases: estimatedCases,
+    estimated_count: estimatedCases.length,
+
+    manual_review_process_ids: (manualCases ?? []).map(c => c.id)
+  }
 
     const paResponse = await fetch(powerAutomateWebhookUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify(payload)
     })
 
+    const paResponseText = await paResponse.text()
+
     if (!paResponse.ok) {
-      const errText = await paResponse.text()
-      throw new Error(`Power Automate Webhook Fehler ${paResponse.status}: ${errText}`)
+      throw new Error(
+        `Power Automate Webhook Fehler ${paResponse.status}: ${paResponseText}`
+      )
     }
 
-    // 6.5. Erfolgreich exportierte Accepted-Faelle auf Status 1000 setzen
-    const acceptedProcessIds = (acceptedRows ?? []).map(r => r.id).filter(Boolean)
+    console.log(
+      `[Power Automate] Job ${jobId} angenommen. HTTP-Status: ${paResponse.status}`
+    )
 
-    if (acceptedProcessIds.length > 0) {
-      console.log(`[DB] Setze ${acceptedProcessIds.length} exportierte Accepted-Faelle auf kda_status 1000...`)
 
-      const { error: statusUpdateError } = await supabase
-        .from('Process_Database')
-        .update({ kda_status: 1000 })
-        .in('id', acceptedProcessIds)
-        .eq('kda_status', 100)
 
-      if (statusUpdateError) {
-        throw new Error(
-          `CSV-Export war erfolgreich, aber kda_status konnte nicht auf 1000 gesetzt werden: ${statusUpdateError.message}`
-        )
-      }
-
-      console.log(`[Success] ${acceptedProcessIds.length} Prozesse erfolgreich auf Status 1000 gesetzt.`)
-    }
-
-    // 7. Erfolgreichen Lauf in pipeline_control protokollieren
+    // 7. Übergabe an Power Automate als "accepted" protokollieren.
+    // Wichtig: "accepted" bedeutet nur, dass Power Automate den Auftrag
+    // angenommen hat. SharePoint und Teams sind zu diesem Zeitpunkt
+    // möglicherweise noch nicht fertig.
     await logPipelineRun(supabase, {
       jobName: JOB_NAME,
-      status: 'success',
+      status: 'accepted',
       collector,
       durationMs: Date.now() - startTime
     })
 
-    console.log(`[Success] Report versendet. Accepted: ${acceptedRows?.length}, Estimated: ${estimatedCases.length}, Manual: ${manualCases?.length}`)
+    console.log(
+      `[Accepted] Report-Job ${jobId} wurde von Power Automate angenommen. ` +
+      `Accepted: ${acceptedRows?.length ?? 0}, ` +
+      `Estimated: ${estimatedCases.length}, ` +
+      `Manual: ${manualCases?.length ?? 0}`
+    )
 
-    return new Response(JSON.stringify({
-      success: true,
-      accepted_count: acceptedRows?.length ?? 0,
-      estimated_count: estimatedCases.length,
-      manual_count: manualCases?.length ?? 0
-    }), {
-      status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    })
+    return new Response(
+      JSON.stringify({
+        success: true,
+        status: 'accepted',
+        job_id: jobId,
+        message: 'Der Report wurde von Power Automate zur Verarbeitung angenommen.',
+        accepted_count: acceptedRows?.length ?? 0,
+        estimated_count: estimatedCases.length,
+        manual_count: manualCases?.length ?? 0
+      }),
+      {
+        status: 202,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json'
+        }
+      }
+    )
 
-  } catch (err) {
-    console.error("Fehler in send-weekly-kda-report:", err)
+  } catch (err: unknown) {
+    const errorMessage =
+      err instanceof Error
+        ? err.message
+        : typeof err === 'string'
+          ? err
+          : JSON.stringify(err)
+
+    console.error(
+      'Fehler in send-weekly-kda-report:',
+      errorMessage
+    )
 
     try {
-      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+      const supabase = createClient(
+        supabaseUrl,
+        supabaseServiceRoleKey
+      )
+
       await logPipelineRun(supabase, {
         jobName: JOB_NAME,
         status: 'error',
-        fatalErrorMessage: err.message
+        fatalErrorMessage: errorMessage
       })
-    } catch (logErr) {
-      console.error("Zusaetzlich: Fehlerlauf konnte nicht protokolliert werden:", logErr)
+    } catch (logErr: unknown) {
+      const logErrorMessage =
+        logErr instanceof Error
+          ? logErr.message
+          : typeof logErr === 'string'
+            ? logErr
+            : JSON.stringify(logErr)
+
+      console.error(
+        'Zusaetzlich: Fehlerlauf konnte nicht protokolliert werden:',
+        logErrorMessage
+      )
     }
 
-    return new Response(JSON.stringify({ error: 'Interner Serverfehler', details: err.message }), {
-      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    })
+    return new Response(
+      JSON.stringify({
+        success: false,
+        status: 'error',
+        error: 'Interner Serverfehler',
+        details: errorMessage
+      }),
+      {
+        status: 500,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json'
+        }
+      }
+    )
   }
 })

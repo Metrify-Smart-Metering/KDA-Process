@@ -560,3 +560,14 @@ entrypoint = "./functions/send-weekly-kda-report/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/send-weekly-kda-report/*.html" ]
+
+[functions.weekly-kda-report-callback]
+enabled = true
+verify_jwt = false
+import_map = "./functions/weekly-kda-report-callback/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/weekly-kda-report-callback/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/weekly-kda-report-callback/*.html" ]

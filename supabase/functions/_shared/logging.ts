@@ -192,7 +192,7 @@ export async function logPipelineRun(
   supabase: SupabaseClient,
   params: {
     jobName: string
-    status: 'success' | 'error'
+    status: 'success' | 'error'| 'accepted'
     collector?: RunErrorCollector
     fatalErrorMessage?: string | null
     durationMs?: number | null
