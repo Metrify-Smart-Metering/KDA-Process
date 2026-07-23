@@ -227,7 +227,7 @@ Deno.serve(async (req) => {
         // ---------------------------------------------------------------------
         /*
         const elapsedMinutes = Math.floor((Date.now() - new Date(mailSentAt).getTime()) / (1000 * 60));
-        let daysSinceExecutionOverride = -1;
+        let daysSinceExecutionOverride = 0;
         if (currentStatus === 1 && elapsedMinutes >= 1) {
           daysSinceExecutionOverride = 0; // Triggert sofort 1. Reminder
         } else if (currentStatus === 2 && elapsedMinutes >= 2) {

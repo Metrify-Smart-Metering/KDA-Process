@@ -18,7 +18,7 @@ const corsHeaders = {
 // ==========================================
 // Diesen Block auskommentieren / auf false setzen, sobald die Views
 // echte PII liefern oder wenn produktiv deployed wird.
-const USE_TEST_PII_FALLBACK = true;
+const USE_TEST_PII_FALLBACK = false;
 
 // ==========================================
 // CASE-INSENSITIVE FIELD GETTER
