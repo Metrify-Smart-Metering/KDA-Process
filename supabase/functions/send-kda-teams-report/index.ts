@@ -142,7 +142,8 @@ Deno.serve(async (req) => {
           customer_f_name,
           customer_l_name,
           customer_mail,
-          meter_number
+          meter_number,
+          melo
         )
       `);
 
@@ -170,7 +171,15 @@ Deno.serve(async (req) => {
     // ==========================================
     // 1.5 SYSTEM-GESUNDHEIT DER LETZTEN 7 TAGE (NEU)
     // ==========================================
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const sevenDaysAgoDate = new Date(
+      Date.UTC(
+        todayUtc.getUTCFullYear(),
+        todayUtc.getUTCMonth(),
+        todayUtc.getUTCDate() - 7
+      )
+    )
+
+    const sevenDaysAgo = sevenDaysAgoDate.toISOString()
 
     const { data: recentRuns, error: recentRunsError } = await supabase
       .from('pipeline_control')
@@ -283,7 +292,7 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
             ${formatSqlNumber(b.Trigger_Candidate_ID)},
             ${escapeSqlString(b.Melo)},
             ${formatSqlDate(b.Org_Exe_Date)},
-            ${formatSqlDate(b.Last_True_Val)},
+            ${formatSqlDate(b.last_true_val)},
             ${escapeSqlString(b.Trigger_Type)},
             ${formatSqlDate(b.Ex_Date)},
             ${formatSqlTimestamp(b.Added)},
@@ -304,11 +313,24 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
       sfSyncDetails = `✅ Snowflake Tabellen synchronisiert (${allProcesses.length} Prozesse, ${backlogEntries.length} Backlog-Einträge überschrieben).`;
       console.log(`[Snowflake-Success] ${sfSyncDetails}`);
 
-    } catch (err) {
-      sfSyncSuccess = false;
-      sfSyncDetails = `❌ Snowflake Sync fehlgeschlagen: ${err.message}`;
-      console.error("[Snowflake-Error] Fehler beim Hochladen nach Snowflake:", err);
-      collector.error(`Snowflake-Sync fehlgeschlagen: ${err.message}`);
+    } catch (err: unknown) {
+      const errorMessage =
+        err instanceof Error
+          ? err.message
+          : String(err)
+
+      sfSyncSuccess = false
+      sfSyncDetails =
+        `❌ Snowflake Sync fehlgeschlagen: ${errorMessage}`
+
+      console.error(
+        '[Snowflake-Error] Fehler beim Hochladen nach Snowflake:',
+        errorMessage
+      )
+
+      collector.error(
+        `Snowflake-Sync fehlgeschlagen: ${errorMessage}`
+      )
     }
 
     // ==========================================
@@ -322,6 +344,48 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
     // --- Phase 1: Letzte 30 Tage ---
     const procsLast30Days = allProcesses.filter(p => isWithinLast30Days(p.created_at));
     const backlogLast30Days = backlogEntries.filter(b => isWithinLast30Days(b.Added));
+
+    // Backlog-Fälle der letzten 7 Tage, bei denen keine E-Mail-Adresse
+    // vorhanden war und deshalb kein KDA-Prozess gestartet werden konnte.
+
+    
+
+    const missingEmailCasesLast7Days = backlogEntries.filter(entry => {
+      if (!entry.Added) return false
+
+      const addedAt = new Date(entry.Added)
+
+      if (Number.isNaN(addedAt.getTime())) {
+        collector.warn(
+          'Trigger_Backlog enthält einen Eintrag mit ungültigem Added-Datum.',
+          {
+            trigger_candidate_id: entry.Trigger_Candidate_ID
+          }
+        )
+        return false
+      }
+
+      const normalizedExtraInfo =
+        typeof entry.extra_info === 'string'
+          ? entry.extra_info
+              .normalize('NFKC')
+              .replace(/[‐‑‒–—]/g, '-')
+              .trim()
+              .toLocaleLowerCase('de-DE')
+          : ''
+
+      return (
+        addedAt >= sevenDaysAgoDate &&
+        normalizedExtraInfo.includes('process_blocked') &&
+        normalizedExtraInfo.includes('e-mail-adresse fehlt')
+      )
+    })
+
+    const missingEmailCountLast7Days =
+      missingEmailCasesLast7Days.length
+
+    const hasMissingEmailCases =
+      missingEmailCountLast7Days > 0
 
     const openedProcs30 = procsLast30Days.length;
     const rejectedCandidates30 = backlogLast30Days.filter(b => b.Trigger_Status === 'rejected' || b.Trigger_Status === 'declined').length;
@@ -404,6 +468,7 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
         const customer_f_name = Array.isArray(pii) ? pii[0]?.customer_f_name : pii?.customer_f_name;
         const customer_l_name = Array.isArray(pii) ? pii[0]?.customer_l_name : pii?.customer_l_name;
         const customer_mail = Array.isArray(pii) ? pii[0]?.customer_mail : pii?.customer_mail;
+        const melo = Array.isArray(pii) ? pii[0]?.melo : pii?.melo  
 
         bounceColumns.push({
           "type": "ColumnSet",
@@ -428,15 +493,30 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
               "items": [
                 {
                   "type": "TextBlock",
-                  "text": `${customer_f_name || ''} ${customer_l_name || ''} (${customer_mail || ''})`,
+                  "text": `${customer_f_name || ''} ${customer_l_name || ''}`,
                   "size": "Small",
                   "wrap": true
+                },
+                {
+                  "type": "TextBlock",
+                  "text": `E-Mail: ${customer_mail || 'nicht vorhanden'}`,
+                  "size": "Small",
+                  "wrap": true,
+                  "spacing": "None"
+                },
+                {
+                  "type": "TextBlock",
+                  "text": `MeLo: ${melo || 'nicht vorhanden'}`,
+                  "size": "Small",
+                  "wrap": true,
+                  "spacing": "None"
                 }
               ]
             }
           ]
         });
       });
+
       if (bouncedCount > 5) {
         bounceColumns.push({
           "type": "TextBlock",
@@ -447,7 +527,78 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
         });
       }
     }
+    const missingEmailColumns: any[] = []
 
+    if (hasMissingEmailCases) {
+      missingEmailCasesLast7Days
+        .slice(0, 10)
+        .forEach(entry => {
+          const triggerCandidateId =
+            entry.Trigger_Candidate_ID ?? 'unbekannt'
+
+          const melo =
+            typeof entry.Melo === 'string' &&
+            entry.Melo.trim().length > 0
+              ? entry.Melo.trim()
+              : 'nicht vorhanden'
+
+          const addedDate =
+            entry.Added
+              ? formatDateDE(entry.Added)
+              : 'unbekannt'
+
+          missingEmailColumns.push({
+            "type": "ColumnSet",
+            "spacing": "Small",
+            "columns": [
+              {
+                "type": "Column",
+                "width": "auto",
+                "items": [
+                  {
+                    "type": "TextBlock",
+                    "text": `• **ID ${triggerCandidateId}**`,
+                    "weight": "Bolder",
+                    "size": "Small",
+                    "color": "Attention"
+                  }
+                ]
+              },
+              {
+                "type": "Column",
+                "width": "stretch",
+                "items": [
+                  {
+                    "type": "TextBlock",
+                    "text": `MeLo: ${melo}`,
+                    "size": "Small",
+                    "wrap": true
+                  },
+                  {
+                    "type": "TextBlock",
+                    "text": `Eingegangen: ${addedDate}`,
+                    "size": "Small",
+                    "isSubtle": true,
+                    "spacing": "None"
+                  }
+                ]
+              }
+            ]
+          })
+        })
+
+      if (missingEmailCountLast7Days > 10) {
+        missingEmailColumns.push({
+          "type": "TextBlock",
+          "text": `*... und ${missingEmailCountLast7Days - 10} weitere Fälle mit fehlender E-Mail-Adresse (siehe Trigger_Backlog).*`,
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "Small",
+          "wrap": true
+        })
+      }
+    }
+    const hasActionItems = hasBounces || hasMissingEmailCases
     // ==========================================
     // 6. ADAPTIVE CARD FÜR MS TEAMS (COMPACT VISUAL UI - 30 TAGE & SNOWFLAKE STATUS)
     // ==========================================
@@ -464,7 +615,7 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
               {
                 "type": "Container",
                 "bleed": true,
-                "style": hasBounces ? "attention" : "good",
+                "style": hasActionItems ? "attention" : "good",
                 "items": [
                   {
                     "type": "ColumnSet",
@@ -478,7 +629,7 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
                             "text": "📊 metrify KDA Dashboard",
                             "weight": "Bolder",
                             "size": "Medium",
-                            "color": hasBounces ? "attention" : "good"
+                            "color": hasActionItems  ? "attention" : "good"
                           },
                           {
                             "type": "TextBlock",
@@ -496,10 +647,10 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
                         "items": [
                           {
                             "type": "TextBlock",
-                            "text": hasBounces ? "⚠️ ACTION REQUIRED" : "✨ SYSTEM STABLE",
+                            "text": hasActionItems ? "⚠️ ACTION REQUIRED" : "✨ SYSTEM STABLE",
                             "weight": "Bolder",
                             "size": "Small",
-                            "color": hasBounces ? "attention" : "good"
+                            "color": hasActionItems ? "attention" : "good"
                           }
                         ]
                       }
@@ -672,6 +823,51 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
                 ]
               },
 
+              // AKTIONSPUNKT: FEHLENDE E-MAIL-ADRESSEN DER LETZTEN 7 TAGE
+              ...(hasMissingEmailCases
+                ? [
+                    {
+                      "type": "Container",
+                      "spacing": "Large",
+                      "separator": true,
+                      "style": "attention",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": `📭 FEHLENDE E-MAIL-ADRESSEN – LETZTE 7 TAGE (${missingEmailCountLast7Days})`,
+                          "weight": "Bolder",
+                          "color": "Attention",
+                          "wrap": true
+                        },
+                        {
+                          "type": "TextBlock",
+                          "text": "Für diese Trigger-Kandidaten konnte kein KDA-Prozess gestartet werden, weil keine E-Mail-Adresse vorhanden war.",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "Small"
+                        },
+                        ...missingEmailColumns
+                      ]
+                    }
+                  ]
+                : [
+                    {
+                      "type": "Container",
+                      "spacing": "Large",
+                      "separator": true,
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "✅ Keine neuen blockierten Fälle wegen fehlender E-Mail-Adresse in den letzten 7 Tagen.",
+                          "color": "Good",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true
+                        }
+                      ]
+                    }
+                  ]),
+
               // ABSCHNITT 4: ACTION ITEM BLOCK (BOUNCES)
               ...(hasBounces ? [
                 {
@@ -764,23 +960,65 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
       status: 200
     });
 
-  } catch (error) {
-    console.error("Fehler im Zwei-Phasen-Report Generator:", error);
+  } catch (error: unknown) {
+    const errorMessage =
+      error instanceof Error
+        ? error.message
+        : String(error)
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    console.error(
+      'Fehler im Zwei-Phasen-Report Generator:',
+      errorMessage
+    )
+
+    const supabaseUrl =
+      Deno.env.get('SUPABASE_URL') ?? ''
+
+    const supabaseServiceRoleKey =
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+
     if (supabaseUrl && supabaseServiceRoleKey) {
-      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
-      await logPipelineRun(supabase, {
-        jobName: JOB_NAME,
-        status: 'error',
-        fatalErrorMessage: error.message
-      })
+      try {
+        const supabase = createClient(
+          supabaseUrl,
+          supabaseServiceRoleKey
+        )
+
+        await logPipelineRun(supabase, {
+          jobName: JOB_NAME,
+          status: 'error',
+          fatalErrorMessage: errorMessage
+        })
+      } catch (loggingError: unknown) {
+        const loggingErrorMessage =
+          loggingError instanceof Error
+            ? loggingError.message
+            : String(loggingError)
+
+        console.error(
+          'Fehlerlauf konnte nicht protokolliert werden:',
+          loggingErrorMessage
+        )
+      }
+    } else {
+      console.error(
+        'Fehlerlauf konnte nicht protokolliert werden: ' +
+        'SUPABASE_URL oder SUPABASE_SERVICE_ROLE_KEY fehlt.'
+      )
     }
 
-    return new Response(JSON.stringify({ error: error.message }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-      status: 500
-    });
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: 'Interner Serverfehler'
+      }),
+      {
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json'
+        },
+        status: 500
+      }
+    )
   }
-});
+})

@@ -1,510 +1,540 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 
-const JOB_NAME = 'Select_KDA_Process_From_Trigger'
+const JOB_NAME = "Select_KDA_Process_From_Trigger"
 
 // ==========================================
 // CORS HEADERS
 // ==========================================
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
 }
+
+// ==========================================
+// TUNING (Option A: Cron läuft durch, Function ist No-op wenn nichts offen)
+// ==========================================
+
+// Wie viele offene Trigger_Backlog-Einträge pro Invocation verarbeitet werden.
+// Ziel: unter 150s Idle Timeout bleiben und nicht zu viel RAM/JSON bewegen.
+// Größer = weniger Cron-Ticks nötig, aber mehr Laufzeit pro Request.
+const BACKLOG_BATCH_SIZE = 1000 // z.B. 500–2000
+
+// Wie viele Melos pro .in(...) Query in einem Chunk abgefragt werden.
+// Zu groß -> Risiko für "Bad Request" (zu lange Request-URL / Gateway-Limits).
+// Zu klein -> mehr Requests, etwas Overhead.
+const MELO_CHUNK_SIZE = 100 // z.B. 50–200
+
+// Wie viele Melo-Chunks gleichzeitig für die Bulk-Abfragen laufen dürfen
+// (gilt separat für accepted- und process-Queries in der Implementierung).
+// Höher = schneller, aber mehr gleichzeitige Requests/Last.
+const QUERY_CONCURRENCY = 4 // z.B. 2–6
+
+// Wie viele Trigger_Backlog-UPDATEs gleichzeitig laufen dürfen.
+// Höher = schneller, aber kann DB/API stärker belasten; zu hoch kann throttlen oder Fehler erhöhen.
+const UPDATE_CONCURRENCY = 8 // z.B. 4–12
+
+// Prozess-Statuswerte, die als "Dead-End" gelten und KEINEN neuen Trigger blockieren sollen.
+// Alle anderen Statuswerte werden (im Lockout-Fenster) als potenziell blockierend behandelt.
+const DEAD_END_STATUSES = [50, 404]
+
 
 // ==========================================
 // CASE-INSENSITIVE FIELD GETTER
 // ==========================================
-/**
- * Safely extracts a field value from an object by checking multiple case variants.
- */
 function getField(obj: any, keys: string[]): any {
-  if (!obj || typeof obj !== 'object') return null;
+  if (!obj || typeof obj !== "object") return null
   for (const k of keys) {
-    if (obj[k] !== undefined && obj[k] !== null) return obj[k];
-    // Check lowercase variant
-    const lowerK = k.toLowerCase();
-    if (obj[lowerK] !== undefined && obj[lowerK] !== null) return obj[lowerK];
-    // Check uppercase variant
-    const upperK = k.toUpperCase();
-    if (obj[upperK] !== undefined && obj[upperK] !== null) return obj[upperK];
+    if (obj[k] !== undefined && obj[k] !== null) return obj[k]
+    const lowerK = k.toLowerCase()
+    if (obj[lowerK] !== undefined && obj[lowerK] !== null) return obj[lowerK]
+    const upperK = k.toUpperCase()
+    if (obj[upperK] !== undefined && obj[upperK] !== null) return obj[upperK]
   }
-  return null;
+  return null
 }
 
 // ==========================================
 // HELPERS
 // ==========================================
+function normalizeMelo(raw: any): string {
+  return String(raw ?? "").trim()
+}
 
-/**
- * Normalizes any incoming date value (ISO string, Date, epoch-day int, etc.)
- * to a clean ISO yyyy-mm-dd string. Returns null on failure.
- * Immune to Javascript timezone parsing shifts.
- */
 function toIsoDate(rawVal: any): string | null {
-  if (rawVal === undefined || rawVal === null) return null;
+  if (rawVal === undefined || rawVal === null) return null
 
-  // If it is already a Date object
   if (rawVal instanceof Date) {
-    const year = rawVal.getUTCFullYear();
-    const month = String(rawVal.getUTCMonth() + 1).padStart(2, '0');
-    const day = String(rawVal.getUTCDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
+    const year = rawVal.getUTCFullYear()
+    const month = String(rawVal.getUTCMonth() + 1).padStart(2, "0")
+    const day = String(rawVal.getUTCDate()).padStart(2, "0")
+    return `${year}-${month}-${day}`
   }
 
-  const s = String(rawVal).trim();
-  if (!s) return null;
+  const s = String(rawVal).trim()
+  if (!s) return null
 
-  // Direct regex extraction to bypass timezone shifts for standard date formats
-  const match = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (match) {
-    return `${match[1]}-${match[2]}-${match[3]}`;
-  }
+  const match = s.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (match) return `${match[1]}-${match[2]}-${match[3]}`
 
-  // Snowflake epoch-day style (e.g. "19725")
   if (/^\d+$/.test(s)) {
-    const n = parseInt(s, 10);
+    const n = parseInt(s, 10)
     if (n < 100000) {
-      const d = new Date(n * 24 * 60 * 60 * 1000);
-      const year = d.getUTCFullYear();
-      const month = String(d.getUTCMonth() + 1).padStart(2, '0');
-      const day = String(d.getUTCDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
+      const d = new Date(n * 24 * 60 * 60 * 1000)
+      const year = d.getUTCFullYear()
+      const month = String(d.getUTCMonth() + 1).padStart(2, "0")
+      const day = String(d.getUTCDate()).padStart(2, "0")
+      return `${year}-${month}-${day}`
     }
   }
 
   try {
-    const d = new Date(s);
+    const d = new Date(s)
     if (!isNaN(d.getTime())) {
-      const year = d.getUTCFullYear();
-      const month = String(d.getUTCMonth() + 1).padStart(2, '0');
-      const day = String(d.getUTCDate()).padStart(2, '0');
-      if (year < 1900 || year > 3000) return null;
-      return `${year}-${month}-${day}`;
+      const year = d.getUTCFullYear()
+      const month = String(d.getUTCMonth() + 1).padStart(2, "0")
+      const day = String(d.getUTCDate()).padStart(2, "0")
+      if (year < 1900 || year > 3000) return null
+      return `${year}-${month}-${day}`
     }
-  } catch (_e) {
-    return null;
+  } catch {
+    return null
   }
-  return null;
+
+  return null
 }
 
-/**
- * Strips any time component from a Date and returns a fresh UTC midnight Date.
- */
 function dayOnly(d: Date): Date {
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
 }
 
-/**
- * Adds N days to an ISO date string. Returns ISO yyyy-mm-dd.
- */
 function addDaysIso(isoDate: string, days: number): string {
-  const d = new Date(isoDate);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().split('T')[0];
+  const d = new Date(isoDate)
+  d.setUTCDate(d.getUTCDate() + days)
+  return d.toISOString().split("T")[0]
 }
 
-/**
- * Absolute day-difference between two ISO date strings.
- */
 function diffDays(isoA: string, isoB: string): number {
-  const a = dayOnly(new Date(isoA)).getTime();
-  const b = dayOnly(new Date(isoB)).getTime();
-  return Math.abs(Math.round((a - b) / (24 * 60 * 60 * 1000)));
+  const a = dayOnly(new Date(isoA)).getTime()
+  const b = dayOnly(new Date(isoB)).getTime()
+  return Math.abs(Math.round((a - b) / (24 * 60 * 60 * 1000)))
 }
 
-/**
- * Returns true if `candidate` lies within +/- window days of `anchor`.
- */
 function isWithinWindow(candidateIso: string | null, anchorIso: string | null, windowDays: number): boolean {
-  if (!candidateIso || !anchorIso) return false;
-  const diff = diffDays(candidateIso, anchorIso);
-  return diff <= windowDays;
+  if (!candidateIso || !anchorIso) return false
+  const diff = diffDays(candidateIso, anchorIso)
+  return diff <= windowDays
+}
+
+function chunkArray<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = []
+  for (let i = 0; i < values.length; i += size) {
+    chunks.push(values.slice(i, i + size))
+  }
+  return chunks
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+
+  async function runner(): Promise<void> {
+    while (true) {
+      const idx = nextIndex++
+      if (idx >= items.length) return
+      results[idx] = await worker(items[idx], idx)
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length)
+  await Promise.all(Array.from({ length: workerCount }, () => runner()))
+  return results
+}
+
+function joinedMelo(processRow: any): string | null {
+  const pii = processRow?.Customer_PII
+  if (!pii) return null
+  if (Array.isArray(pii)) return pii[0]?.melo ? normalizeMelo(pii[0].melo) : null
+  return pii?.melo ? normalizeMelo(pii.melo) : null
 }
 
 // ==========================================
 // MAIN HANDLER
 // ==========================================
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders });
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders })
   }
 
-  // Supabase-Client deklarieren (damit er auch im catch-Block zur Verfügung steht)
-  let supabase: any = null;
+  let supabase: any = null
+  const startTime = Date.now()
+  const collector = new RunErrorCollector()
 
   try {
-    console.log("=== Select_KDA_Process_From_Trigger gestartet ===");
+    console.log("=== Select_KDA_Process_From_Trigger gestartet ===")
 
-    // 1. Webhook Payload sichern und auswerten
-    let payload: any = null;
+    // 1) Webhook Payload sichern und auswerten
+    let payload: any = null
     try {
-      const reqText = await req.text();
-      if (reqText) {
-        payload = JSON.parse(reqText);
-      }
-    } catch (e) {
-      console.log("[Pipeline] Konnte Request-Body nicht als JSON parsen. Fahre ohne Webhook-Filterung fort.");
+      const reqText = await req.text()
+      if (reqText) payload = JSON.parse(reqText)
+    } catch {
+      console.log("[Pipeline] Konnte Request-Body nicht als JSON parsen. Fahre ohne Webhook-Filterung fort.")
     }
 
-    // Pipeline-Filter: Falls der Aufruf von unserem Webhook auf pipeline_control kommt
-    if (payload && payload.type === 'INSERT' && payload.table === 'pipeline_control') {
-      const jobName = payload.record?.job_name;
-      const status = payload.record?.status;
+    // Pipeline-Filter
+    if (payload && payload.type === "INSERT" && payload.table === "pipeline_control") {
+      const jobName = payload.record?.job_name
+      const status = payload.record?.status
 
-      if (jobName !== 'Get_Trigger_Data' || status !== 'success') {
-        console.log(`[Pipeline] Ignoriere Event für Job '${jobName}' mit Status '${status}'.`);
+      if (jobName !== "Get_Trigger_Data" || status !== "success") {
+        console.log(`[Pipeline] Ignoriere Event für Job '${jobName}' mit Status '${status}'.`)
         return new Response(JSON.stringify({ message: "Ignoriert", success: true }), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
-          status: 200
-        });
+          status: 200,
+        })
       }
-      console.log("[Pipeline] Webhook empfangen: Get_Trigger_Data war erfolgreich! Starte Verarbeitung...");
+
+      console.log("[Pipeline] Webhook empfangen: Get_Trigger_Data war erfolgreich! Starte Verarbeitung...")
     }
 
-
-    // 2. Supabase Client mit Service Role initialisieren (RLS-Bypass)
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+    // 2) Supabase Client mit Service Role initialisieren
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? ""
     const supabaseSecretKey =
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ??
-      Deno.env.get('SUPABASE_SECRET_KEY') ??
-      '';
-    supabase = createClient(supabaseUrl, supabaseSecretKey);
-    const startTime = Date.now()
-    const collector = new RunErrorCollector()
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
+      Deno.env.get("SUPABASE_SECRET_KEY") ??
+      ""
+    supabase = createClient(supabaseUrl, supabaseSecretKey)
 
+    // 3) Heutiges Datum (Europe/Berlin)
+    const now = new Date()
+    const fmt = new Intl.DateTimeFormat("de-DE", {
+      timeZone: "Europe/Berlin",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    })
+    const parts = fmt.formatToParts(now)
+    const day = parts.find((p) => p.type === "day")?.value ?? "01"
+    const month = parts.find((p) => p.type === "month")?.value ?? "01"
+    const year = parts.find((p) => p.type === "year")?.value ?? "2026"
+    const todayIso = `${year}-${month}-${day}`
+    console.log(`[Info] Heutiges Datum (Berlin): ${todayIso}`)
 
-    // 3. Heutiges Datum (Europe/Berlin) als ISO yyyy-mm-dd bestimmen
-    const now = new Date();
-    const fmt = new Intl.DateTimeFormat('de-DE', {
-      timeZone: 'Europe/Berlin',
-      day: '2-digit', month: '2-digit', year: 'numeric'
-    });
-    const parts = fmt.formatToParts(now);
-    const day = parts.find(p => p.type === 'day')?.value ?? '01';
-    const month = parts.find(p => p.type === 'month')?.value ?? '01';
-    const year = parts.find(p => p.type === 'year')?.value ?? '2026';
-    const todayIso = `${year}-${month}-${day}`;
-    console.log(`[Info] Heutiges Datum (Berlin): ${todayIso}`);
-
-
-    // 4. Trigger_Config laden -> Map nach id
-    console.log("[Load] Trigger_Config laden...");
+    // 4) Trigger_Config laden
+    console.log("[Load] Trigger_Config laden...")
     const { data: configs, error: configErr } = await supabase
-      .from('Trigger_Config')
-      .select('*');
+      .from("Trigger_Config")
+      .select("*")
+
     if (configErr || !configs) {
-      throw new Error(`Konfiguration konnte nicht geladen werden: ${configErr?.message}`);
+      throw new Error(`Konfiguration konnte nicht geladen werden: ${configErr?.message}`)
     }
-    const configMap = new Map<string, any>();
-    for (const c of configs) configMap.set(c.id, c);
-    console.log(`[Load] ${configs.length} Konfigurationen geladen.`);
 
+    const configMap = new Map<string, any>()
+    for (const c of configs) configMap.set(c.id, c)
+    console.log(`[Load] ${configs.length} Konfigurationen geladen.`)
 
-    // 5. Offene Backlog-Einträge laden (Nicht-Final)
-    console.log("[Load] Offene Trigger_Backlog-Einträge laden...");
+    // 5) Offene Backlog-Einträge (BATCHED)
+    console.log(`[Load] Offene Trigger_Backlog-Einträge laden (limit=${BACKLOG_BATCH_SIZE})...`)
     const { data: backlog, error: backlogErr } = await supabase
-      .from('Trigger_Backlog')
-      .select('*')
-      .not('Trigger_Status', 'in', '(accepted,declined,rejected)'); // PostgREST-konforme Syntax
-    
+      .from("Trigger_Backlog")
+      .select("*")
+      .not("Trigger_Status", "in", "(accepted,declined,rejected)")
+      .order("Added", { ascending: true })
+      .order("Trigger_Candidate_ID", { ascending: true })
+      .limit(BACKLOG_BATCH_SIZE)
+
     if (backlogErr || !backlog) {
-      throw new Error(`Trigger_Backlog konnte nicht geladen werden: ${backlogErr?.message}`);
+      throw new Error(`Trigger_Backlog konnte nicht geladen werden: ${backlogErr?.message}`)
     }
-    console.log(`[Load] ${backlog.length} offene Backlog-Einträge gefunden.`);
 
+    console.log(`[Load] ${backlog.length} offene Backlog-Einträge (Batch) gefunden.`)
 
+    // Variante A: Cron läuft durch, wenn nichts offen ist -> schnell No-op
     if (backlog.length === 0) {
-      // Auch wenn nichts zu tun ist, müssen wir Erfolg an pipeline_control melden, 
-      // damit die Kette für insert_new_process nicht unkontrolliert unterbrochen wird
-      console.log("[Pipeline] Keine offenen Backlog-Einträge. Melde trotzdem Erfolg an pipeline_control...");
+      console.log("[Pipeline] Keine offenen Backlog-Einträge. Melde Erfolg an pipeline_control...")
       await logPipelineRun(supabase, {
         jobName: JOB_NAME,
-        status: 'success',
+        status: "success",
         collector,
-        durationMs: Date.now() - startTime
+        durationMs: Date.now() - startTime,
       })
 
       return new Response(JSON.stringify({
-        success: true, message: "Keine offenen Backlog-Einträge zu verarbeiten."
-      }), { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 });
+        success: true,
+        message: "Keine offenen Backlog-Einträge zu verarbeiten.",
+        processed: 0,
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 200,
+      })
     }
 
-    // Eindeutige Melos extrahieren und robuster gegen Leerzeichen aufbauen
-    const rawMelos = backlog.map(r => String(getField(r, ['Melo', 'melo']) ?? '')).filter(Boolean);
-    const queryMelos: string[] = [];
-    for (const m of rawMelos) {
-      queryMelos.push(m);
-      queryMelos.push(m.trim());
-      queryMelos.push(`${m.trim()} `);
-    }
-    const meloSet = Array.from(new Set(queryMelos));
+    // MeloSet: trim + dedupe (keine künstlichen Leerzeichen-Varianten)
+    const meloSet = Array.from(new Set(
+      backlog
+        .map((r: any) => normalizeMelo(getField(r, ["Melo", "melo"])))
+        .filter(Boolean)
+    ))
 
+    console.log(`[Load] MeloSet: ${meloSet.length} eindeutige Melos aus dem Batch.`)
 
-    // 5a. ALLE bereits existierenden accepted-Backlog-Einträge für diese Melos laden
-    console.log(`[Load] Lade accepted-Nachbarn für ${meloSet.length} Melo-Varianten...`);
-    let acceptedRows: any[] = [];
-    {
-      const { data: accData, error: accErr } = await supabase
-        .from('Trigger_Backlog')
-        .select('*')
-        .eq('Trigger_Status', 'accepted')
-        .in('Melo', meloSet);
-      if (accErr) {
-        console.warn(`[Warn] accepted-Nachbarn konnten nicht geladen werden: ${accErr.message}`);
-        collector.warn(`accepted-Nachbarn konnten nicht geladen werden: ${accErr.message}`)
-      } else {
-        acceptedRows = accData ?? [];
-      }
-    }
+    const meloChunks = chunkArray(meloSet, MELO_CHUNK_SIZE)
+    console.log(`[Load] Chunking: ${meloChunks.length} Chunks à max ${MELO_CHUNK_SIZE}, conc=${QUERY_CONCURRENCY}.`)
 
-    const acceptedByMelo = new Map<string, any[]>();
-    for (const r of acceptedRows) {
-      const meloVal = getField(r, ['Melo', 'melo']);
-      if (!meloVal) continue;
-      const key = String(meloVal).trim(); // Immer trimmen für den in-memory Abgleich
-      if (!acceptedByMelo.has(key)) acceptedByMelo.set(key, []);
-      acceptedByMelo.get(key)!.push(r);
-    }
+    // 5a) accepted-Nachbarn laden (chunked + kontrolliert parallel, FAIL-CLOSED)
+    console.log("[Load] Lade accepted-Nachbarn (chunked)...")
+    const acceptedChunkResults = await mapWithConcurrency(
+      meloChunks,
+      QUERY_CONCURRENCY,
+      async (meloChunk, idx) => {
+        const { data, error } = await supabase
+          .from("Trigger_Backlog")
+          .select("Trigger_Candidate_ID,Melo,Org_Exe_Date,Trigger_Status")
+          .eq("Trigger_Status", "accepted")
+          .in("Melo", meloChunk)
 
+        if (error) {
+          console.error("[Error] accepted-chunk failed:", JSON.stringify({
+            idx,
+            chunkSize: meloChunk.length,
+            message: error.message,
+            code: error.code ?? null,
+            details: error.details ?? null,
+            hint: error.hint ?? null,
+          }))
 
-    // 6. Laufende Prozesse aus Process_Database vorab laden
-    console.log(`[Load] Process_Database via Customer_PII für ${meloSet.length} Melo-Varianten abfragen...`);
-    let processRows: any[] = [];
-    {
-      const { data: procData, error: procErr } = await supabase
-        .from('Process_Database')
-        .select(`
-          id,
-          execution_date,
-          kda_status,
-          customer_pii_id,
-          Customer_PII!inner (
-            melo
+          throw new Error(
+            `Accepted-Nachbarn konnten nicht geladen werden (chunk ${idx + 1}/${meloChunks.length}): ${error.message}`
           )
-        `)
-        .in('Customer_PII.melo', meloSet);
-      if (procErr) {
-        console.warn(`[Warn] Process_Database konnte nicht geladen werden: ${procErr.message}`);
-        collector.warn(`Process_Database konnte nicht geladen werden: ${procErr.message}`)
-      } else {
-        processRows = procData ?? [];
-      }
-    }
-    const DEAD_END_STATUSES = [50, 404];
-    const processByMelo = new Map<string, any[]>();
-    for (const p of processRows) {
-      const statusNum = Number(getField(p, ['kda_status', 'status']) ?? -1);
-      if (!Number.isNaN(statusNum) && DEAD_END_STATUSES.includes(statusNum)) {
-        console.log(`[Skip:dead_end_status] Process ${p.id} hat Dead-End-Status ${statusNum}. Blockiert keinen neuen Trigger.`);
-        continue;
-      }
-
-      const pii = p.Customer_PII;
-      let meloFromJoin = null;
-      if (pii) {
-        if (Array.isArray(pii)) {
-          meloFromJoin = pii[0]?.melo;
-        } else {
-          meloFromJoin = pii.melo;
         }
-      }
 
-      const cleanMelo = meloFromJoin ? String(meloFromJoin).trim() : null;
-      if (!cleanMelo) {
-        console.warn(`[Skip:process-without-melo] Process ${p.id} hat keine auflösbare Melo über Customer_PII.`);
-        continue;
+        return data ?? []
       }
+    )
 
-      if (!processByMelo.has(cleanMelo)) processByMelo.set(cleanMelo, []);
-      processByMelo.get(cleanMelo)!.push(p);
+    const acceptedRows = acceptedChunkResults.flat()
+    console.log(`[Load] acceptedRows geladen: ${acceptedRows.length}`)
+
+    const acceptedByMelo = new Map<string, any[]>()
+    for (const r of acceptedRows) {
+      const m = normalizeMelo(getField(r, ["Melo", "melo"]))
+      if (!m) continue
+      if (!acceptedByMelo.has(m)) acceptedByMelo.set(m, [])
+      acceptedByMelo.get(m)!.push(r)
     }
-    console.log(`[Load] ${processRows.length} Process_Database-Zeilen geladen, ${processByMelo.size} Melos mit blockierenden Prozessen gemappt (Dead-Ends ${DEAD_END_STATUSES.join('/')} ausgenommen).`);
 
+    // 6) Prozesse aus Process_Database laden (chunked + kontrolliert parallel, FAIL-CLOSED)
+    console.log("[Load] Lade Process_Database via Customer_PII (chunked)...")
+    const processChunkResults = await mapWithConcurrency(
+      meloChunks,
+      QUERY_CONCURRENCY,
+      async (meloChunk, idx) => {
+        const { data, error } = await supabase
+          .from("Process_Database")
+          .select(`
+            id,
+            execution_date,
+            kda_status,
+            customer_pii_id,
+            Customer_PII!inner (
+              melo
+            )
+          `)
+          .in("Customer_PII.melo", meloChunk)
 
-    // 7. Pro Backlog-Eintrag die Regeln (3a -> 3e) anwenden
+        if (error) {
+          console.error("[Error] process-chunk failed:", JSON.stringify({
+            idx,
+            chunkSize: meloChunk.length,
+            message: error.message,
+            code: error.code ?? null,
+            details: error.details ?? null,
+            hint: error.hint ?? null,
+          }))
+
+          throw new Error(
+            `Process_Database konnte nicht geladen werden (chunk ${idx + 1}/${meloChunks.length}): ${error.message}`
+          )
+        }
+
+        return data ?? []
+      }
+    )
+
+    const processRows = processChunkResults.flat()
+
+    const processByMelo = new Map<string, any[]>()
+    for (const p of processRows) {
+      const statusNum = Number(getField(p, ["kda_status", "status"]) ?? -1)
+      if (!Number.isNaN(statusNum) && DEAD_END_STATUSES.includes(statusNum)) {
+        continue
+      }
+
+      const m = joinedMelo(p)
+      if (!m) continue
+
+      if (!processByMelo.has(m)) processByMelo.set(m, [])
+      processByMelo.get(m)!.push(p)
+    }
+
+    console.log(`[Load] processRows geladen: ${processRows.length}; mapped melos=${processByMelo.size}.`)
+
+    // 7) Pro Backlog-Eintrag Regeln anwenden
     const updates: Array<{
-      id: any;
-      Trigger_Status: string;
-      Ex_Date: string | null;
-      extra_info?: string | null;
-    }> = [];
+      id: any
+      Trigger_Status: string
+      Ex_Date: string | null
+      extra_info?: string | null
+    }> = []
 
-    let countAccepted = 0, countRejected = 0, countWait = 0, countSkip = 0, countInvalid = 0;
+    let countAccepted = 0, countRejected = 0, countWait = 0, countSkip = 0, countInvalid = 0
 
     for (const rec of backlog) {
-      const recId = getField(rec, ['Trigger_Candidate_ID', 'id']);
-      const triggerType = getField(rec, ['Trigger_Type', 'trigger_type']);
-      const cfg = configMap.get(triggerType);
+      const recId = getField(rec, ["Trigger_Candidate_ID", "id"])
+      const triggerType = getField(rec, ["Trigger_Type", "trigger_type"])
+      const cfg = configMap.get(triggerType)
 
       if (!cfg) {
-        console.warn(`[Skip] Eintrag ${recId} hat keine passende Config für '${triggerType}'. Überspringe.`);
-        countSkip++;
-        continue;
+        console.warn(`[Skip] Eintrag ${recId} hat keine passende Config für '${triggerType}'.`)
+        countSkip++
+        continue
       }
 
-      // Support alternative Spaltennamen in Trigger_Config
-      const minLead = Number(getField(cfg, ['min_lead_time', 'min_lead_time_days']) ?? 0);
-      const maxLead = Number(getField(cfg, ['max_lead_time', 'max_lead_time_days']) ?? 0);
-      const lockout = Number(getField(cfg, ['lockout_period', 'lockout_period_days']) ?? 0);
+      const minLead = Number(getField(cfg, ["min_lead_time", "min_lead_time_days"]) ?? 0)
+      const maxLead = Number(getField(cfg, ["max_lead_time", "max_lead_time_days"]) ?? 0)
+      const lockout = Number(getField(cfg, ["lockout_period", "lockout_period_days"]) ?? 0)
 
-      const rawOrgExeDate = getField(rec, ['Org_Exe_Date', 'org_exe_date']);
-      const rawLastTrueVal = getField(rec, ['Last_True_Val', 'last_true_val', 'Last_True_Value', 'last_true_value']);
-
-      const orgExeDate = toIsoDate(rawOrgExeDate);
-      const lastTrueVal = toIsoDate(rawLastTrueVal);
+      const orgExeDate = toIsoDate(getField(rec, ["Org_Exe_Date", "org_exe_date"]))
+      const lastTrueVal = toIsoDate(getField(rec, ["Last_True_Val", "last_true_val", "Last_True_Value", "last_true_value"]))
 
       if (!orgExeDate) {
-        console.warn(`[Skip] Eintrag ${recId} hat ungültiges Org_Exe_Date (${rawOrgExeDate}).`);
-        countInvalid++;
-        continue;
+        console.warn(`[Skip] Eintrag ${recId} hat ungültiges Org_Exe_Date (${getField(rec, ["Org_Exe_Date", "org_exe_date"])}).`)
+        countInvalid++
+        continue
       }
 
-      const melo = String(getField(rec, ['Melo', 'melo']) ?? '').trim();
+      const melo = normalizeMelo(getField(rec, ["Melo", "melo"]))
 
-      // -----------------------------------------------------
-      // 3a. Bereits-bedient-Check
-      // -----------------------------------------------------
+      // 3a) Bereits-bedient-Check (nur Vergangenheit)
       if (orgExeDate < todayIso) {
-        const neighbors = (acceptedByMelo.get(melo) ?? []).filter(other => {
-          const otherId = getField(other, ['Trigger_Candidate_ID', 'id']);
-          if (otherId === recId) return false;
-          const otherDate = toIsoDate(getField(other, ['Org_Exe_Date', 'org_exe_date']));
-          if (!otherDate) return false;
-          return isWithinWindow(otherDate, orgExeDate, lockout);
-        });
+        const neighbors = (acceptedByMelo.get(melo) ?? []).filter((other) => {
+          const otherId = getField(other, ["Trigger_Candidate_ID", "id"])
+          if (otherId === recId) return false
+          const otherDate = toIsoDate(getField(other, ["Org_Exe_Date", "org_exe_date"]))
+          if (!otherDate) return false
+          return isWithinWindow(otherDate, orgExeDate, lockout)
+        })
+
         if (neighbors.length > 0) {
-          console.log(`[Rejected:already_served] ${recId} Melo=${melo} OrgExe=${orgExeDate} hat ${neighbors.length} accepted-Nachbarn im Lockout.`);
           updates.push({
             id: recId,
-            Trigger_Status: 'rejected',
+            Trigger_Status: "rejected",
             Ex_Date: null,
-            extra_info: 'already_served'
-          });
-          countRejected++;
-          continue;
+            extra_info: "already_served",
+          })
+          countRejected++
+          continue
         }
       }
 
-      // -----------------------------------------------------
-      // 3b. Ex_Date bestimmen
-      // -----------------------------------------------------
-      const upperBoundIso = addDaysIso(todayIso, maxLead);
-      const lowerBoundIso = addDaysIso(todayIso, minLead);
+      // 3b) Ex_Date bestimmen
+      const upperBoundIso = addDaysIso(todayIso, maxLead)
+      const lowerBoundIso = addDaysIso(todayIso, minLead)
 
       if (orgExeDate > upperBoundIso) {
-        console.log(`[Skip:too_far] ${recId} Melo=${melo} OrgExe=${orgExeDate} > today+maxLead (${upperBoundIso}). Warte.`);
-        countSkip++;
-        continue;
+        countSkip++
+        continue
       }
 
-      let exDate: string;
-      if (orgExeDate <= lowerBoundIso) {
-        exDate = lowerBoundIso;
-      } else {
-        exDate = orgExeDate;
-      }
+      const exDate = (orgExeDate <= lowerBoundIso) ? lowerBoundIso : orgExeDate
 
-      // -----------------------------------------------------
-      // 3c. True-Value innerhalb Lockout?
-      // -----------------------------------------------------
-      const trueBlockedByEx  = isWithinWindow(lastTrueVal, exDate, lockout);
-      const trueBlockedByOrg = isWithinWindow(lastTrueVal, orgExeDate, lockout);
-
-      if (trueBlockedByEx || trueBlockedByOrg) {
-        console.log(`[Rejected:true_value_in_lockout] ${recId} Melo=${melo} LastTrue=${lastTrueVal} blockt ExDate=${exDate}/OrgExe=${orgExeDate}. Lockout=${lockout} Tage.`);
+      // 3c) True-Value innerhalb Lockout?
+      if (isWithinWindow(lastTrueVal, exDate, lockout) || isWithinWindow(lastTrueVal, orgExeDate, lockout)) {
         updates.push({
           id: recId,
-          Trigger_Status: 'rejected',
+          Trigger_Status: "rejected",
           Ex_Date: exDate,
-          extra_info: 'true_value_in_lockout_period'
-        });
-        countRejected++;
-        continue;
+          extra_info: "true_value_in_lockout_period",
+        })
+        countRejected++
+        continue
       }
 
-      // -----------------------------------------------------
-      // 3d. Laufender Prozess in Process_Database im Lockout?
-      // -----------------------------------------------------
-      const runningProcs = processByMelo.get(melo) ?? [];
-      const conflicting = runningProcs.find(p => {
-        const procDate = toIsoDate(getField(p, ['execution_date', 'execution_date']));
-        return isWithinWindow(procDate, exDate, lockout) || isWithinWindow(procDate, orgExeDate, lockout);
-      });
+      // 3d) Laufender Prozess im Lockout?
+      const runningProcs = processByMelo.get(melo) ?? []
+      const conflicting = runningProcs.find((p) => {
+        const procDate = toIsoDate(getField(p, ["execution_date"]))
+        return isWithinWindow(procDate, exDate, lockout) || isWithinWindow(procDate, orgExeDate, lockout)
+      })
 
       if (conflicting) {
-        console.log(`[Wait] ${recId} Melo=${melo} hat laufenden Prozess am ${toIsoDate(getField(conflicting, ['execution_date']))} im Lockout.`);
         updates.push({
           id: recId,
-          Trigger_Status: 'wait--Laufender Prozess',
+          Trigger_Status: "wait--Laufender Prozess",
           Ex_Date: exDate,
-          extra_info: 'Extra/Interpolation via Shootingstar'
-        });
-        countWait++;
-        continue;
+          extra_info: "Extra/Interpolation via Shootingstar",
+        })
+        countWait++
+        continue
       }
 
-      // -----------------------------------------------------
-      // 3e. Accepted
-      // -----------------------------------------------------
-      console.log(`[Accepted] ${recId} Melo=${melo} OrgExe=${orgExeDate} ExDate=${exDate}.`);
+      // 3e) Accepted
       updates.push({
         id: recId,
-        Trigger_Status: 'accepted',
+        Trigger_Status: "accepted",
         Ex_Date: exDate,
-        extra_info: null
-      });
-      countAccepted++;
+        extra_info: null,
+      })
+      countAccepted++
     }
 
-    // ==========================================
-    // 8. Updates in die DB schreiben
-    // ==========================================
-    console.log(`[Plan] Updates: accepted=${countAccepted}, rejected=${countRejected}, wait=${countWait}, skip=${countSkip}, invalid=${countInvalid}, total-updates=${updates.length}`);
+    console.log(`[Plan] Updates: accepted=${countAccepted}, rejected=${countRejected}, wait=${countWait}, skip=${countSkip}, invalid=${countInvalid}, total=${updates.length}`)
 
-    let updatedCount = 0;
-    let failedCount = 0;
+    // 8) Updates schreiben (kontrolliert parallel)
+    let updatedCount = 0
+    let failedCount = 0
 
-    // Sequenzielles Update pro Datensatz
-    const CHUNK = 25;
-    for (let i = 0; i < updates.length; i += CHUNK) {
-      const chunk = updates.slice(i, i + CHUNK);
-      const results = await Promise.all(chunk.map(async (u) => {
-        const payload: any = {
-          Trigger_Status: u.Trigger_Status,
-          Ex_Date: u.Ex_Date,
-          extra_info: u.extra_info ?? null
-        };
-        const { error } = await supabase
-          .from('Trigger_Backlog')
-          .update(payload)
-          .eq('Trigger_Candidate_ID', u.id);
-        if (error) {
-          console.error(`[Update-Fehler] id=${u.id}: ${error.message}`);
-          collector.error(`Backlog-Update fehlgeschlagen: ${error.message}`, { trigger_candidate_id: u.id })
-          return false;
-        }
-        return true;
-      }));
-      for (const ok of results) ok ? updatedCount++ : failedCount++;
-    }
+    await mapWithConcurrency(updates, UPDATE_CONCURRENCY, async (u) => {
+      const payload: any = {
+        Trigger_Status: u.Trigger_Status,
+        Ex_Date: u.Ex_Date,
+        extra_info: u.extra_info ?? null,
+      }
 
-    console.log(`[Done] ${updatedCount} Updates ok, ${failedCount} fehlerhaft.`);
+      const { error } = await supabase
+        .from("Trigger_Backlog")
+        .update(payload)
+        .eq("Trigger_Candidate_ID", u.id)
 
-    // ==========================================
-    // PIPELINE: ERFOLGSMELDUNG AN STEUERUNGSTABELLE
-    // ==========================================
-    console.log("[Pipeline] Melde Erfolg an pipeline_control...");
-    await logPipelineRun(supabase, {
-      jobName: JOB_NAME,
-      status: 'success',
-      collector,
-      durationMs: Date.now() - startTime
+      if (error) {
+        failedCount++
+        collector.error(`Backlog-Update fehlgeschlagen: ${error.message}`, { trigger_candidate_id: u.id })
+        return
+      }
+
+      updatedCount++
     })
 
+    console.log(`[Done] ${updatedCount} Updates ok, ${failedCount} fehlerhaft.`)
+
+    // Pipeline: Erfolg/Fehler melden
+    await logPipelineRun(supabase, {
+      jobName: JOB_NAME,
+      status: failedCount === 0 ? "success" : "error",
+      collector,
+      durationMs: Date.now() - startTime,
+      fatalErrorMessage: failedCount === 0 ? undefined : `failed_updates=${failedCount}`,
+    })
 
     return new Response(JSON.stringify({
-      success: true,
+      success: failedCount === 0,
       processed: backlog.length,
       accepted: countAccepted,
       rejected: countRejected,
@@ -512,38 +542,35 @@ Deno.serve(async (req) => {
       skipped: countSkip,
       invalid: countInvalid,
       updated: updatedCount,
-      failed: failedCount
+      failed: failedCount,
+      note: "Cron kann weiterlaufen: Wenn keine offenen Einträge existieren, wird beim nächsten Lauf schnell No-op zurückgegeben.",
     }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
-      status: 200
-    });
-
+      status: failedCount === 0 ? 200 : 500,
+    })
   } catch (error) {
-    console.error("Kritischer Fehler in Select_KDA_Process_From_Trigger:", error);
+    console.error("Kritischer Fehler in Select_KDA_Process_From_Trigger:", error)
 
-    // ==========================================
-    // PIPELINE: FEHLERMELDUNG AN STEUERUNGSTABELLE
-    // ==========================================
     if (supabase) {
       try {
         await logPipelineRun(supabase, {
           jobName: JOB_NAME,
-          status: 'error',
+          status: "error",
           collector,
-          fatalErrorMessage: error.message || String(error)
+          fatalErrorMessage: (error as Error)?.message ?? String(error),
         })
       } catch (dbLogErr) {
-        console.error("Fehler beim Schreiben des Error-Logs in pipeline_control:", dbLogErr.message);
+        console.error("Fehler beim Schreiben des Error-Logs in pipeline_control:", dbLogErr.message)
       }
     }
 
     return new Response(JSON.stringify({
       success: false,
-      error_message: (error as Error).message,
-      error_stack: (error as Error).stack
+      error_message: (error as Error)?.message ?? String(error),
+      error_stack: (error as Error)?.stack,
     }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
-      status: 500
-    });
+      status: 500,
+    })
   }
-});
+})

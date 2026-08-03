@@ -27,6 +27,8 @@ Deno.serve(async (req) => {
     console.log("🔄 CORS OPTIONS Preflight Request erfolgreich beantwortet.");
     return new Response('ok', { headers: corsHeaders })
   }
+  // Wird für Recovery und Fehler-Logging außerhalb des Haupt-try benötigt.
+  let processId: string | number | null = null;
 
   // Wir fangen alle Fehler global ab, damit die Edge Function niemals stumm stirbt
   try {
@@ -54,6 +56,8 @@ Deno.serve(async (req) => {
     
     const record = payload.record || payload.new_record; // Manche Webhooks senden new_record
     const oldRecord = payload.old_record;
+    // Früh speichern, damit der globale catch den Request-Body nicht erneut lesen muss.
+    processId = record?.id ?? null;
 
     if (!record) {
       console.warn("⚠️ [WARNUNG] Kein 'record' oder 'new_record' im Payload gefunden! Webhook-Struktur prüfen.");
@@ -393,29 +397,85 @@ Deno.serve(async (req) => {
     );
 
   } catch (globalError) {
-    console.error("🚨 Unbehandelte Ausnahme:", globalError.stack || globalError.message);
-    // Recovery: setze auf 9, damit der Prozess nicht im Status 4 hängenbleibt
+    const errorMessage = globalError instanceof Error
+      ? globalError.message
+      : String(globalError);
+
+    const errorStack = globalError instanceof Error
+      ? globalError.stack
+      : undefined;
+
+    console.error(
+      "🚨 Unbehandelte Ausnahme:",
+      errorStack ?? errorMessage
+    );
+
+    // Recovery: auf Status 9 setzen, damit der Prozess nicht in Status 4 hängenbleibt.
+    // Wichtig: Den Request-Body hier nicht erneut lesen. Er wurde bereits mit
+    // req.text() verbraucht.
     try {
-      const payload = JSON.parse(await req.clone().text());
-      const record = payload.record || payload.new_record;
-      if (record?.id) {
-        const supabaseUrl = Deno.env.get('SUPABASE_URL');
-        const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SECRET_KEY');
-        if (supabaseUrl && supabaseSecretKey) {
-          const supabase = createClient(supabaseUrl, supabaseSecretKey);
-          await supabase.from('Process_Database').update({ kda_status: 9 }).eq('id', record.id);
-          await logPipelineRun(supabase, {
-            jobName: JOB_NAME,
-            status: 'error',
-            fatalErrorMessage: globalError.message
-          });
+      const supabaseUrl = Deno.env.get('SUPABASE_URL');
+      const supabaseSecretKey =
+        Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ||
+        Deno.env.get('SUPABASE_SECRET_KEY');
+
+      if (!supabaseUrl || !supabaseSecretKey) {
+        console.error(
+          "🚨 Recovery nicht möglich: Supabase-Umgebungsvariablen fehlen."
+        );
+      } else {
+        const supabase = createClient(supabaseUrl, supabaseSecretKey);
+
+        if (processId !== null) {
+          const { error: recoveryError } = await supabase
+            .from('Process_Database')
+            .update({ kda_status: 4 })
+            .eq('id', processId);
+
+          if (recoveryError) {
+            console.error(
+              `🚨 Recovery-Update für Process-ID ${processId} fehlgeschlagen: ${recoveryError.message}`
+            );
+          }
+        } else {
+          console.warn(
+            "⚠️ Keine Process-ID verfügbar; Status konnte nicht auf 9 gesetzt werden."
+          );
         }
+
+        // status='error' löst in logging.ts den Teams-Alarm aus.
+        // Das Logging wird auch ausgeführt, wenn keine Process-ID verfügbar ist.
+        await logPipelineRun(supabase, {
+          jobName: JOB_NAME,
+          status: 'error',
+          fatalErrorMessage: processId !== null
+            ? `${errorMessage} | process_id=${processId}`
+            : errorMessage
+        });
       }
-    } catch (_) {}
+    } catch (recoveryError) {
+      // Nicht mehr stumm verschlucken: Sonst ist nicht erkennbar,
+      // warum pipeline_control oder der Teams-Alarm nicht erreicht wurde.
+      console.error(
+        "🚨 Fehler im Recovery-/Alert-Pfad:",
+        recoveryError instanceof Error
+          ? recoveryError.stack ?? recoveryError.message
+          : String(recoveryError)
+      );
+    }
 
     return new Response(
-      JSON.stringify({ error: 'Interner Serverfehler', details: globalError.message }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      JSON.stringify({
+        error: 'Interner Serverfehler',
+        details: errorMessage
+      }),
+      {
+        status: 500,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json'
+        }
+      }
     );
   }
 })

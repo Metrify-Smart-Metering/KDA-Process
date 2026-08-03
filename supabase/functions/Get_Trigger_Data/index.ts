@@ -13,7 +13,7 @@ const BACKWARD_LOOKING_DAYS = 180;      // Historischer Datumsfilter (Regel 3)
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-cron-secret',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
@@ -60,9 +60,55 @@ Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
   }
+  if (req.method !== 'POST') {
+    return new Response(
+      JSON.stringify({ success: false, error: 'Method not allowed' }),
+      {
+        status: 405,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+          'Allow': 'POST',
+        },
+      },
+    )
+  }
+
+  const expectedSecret = Deno.env.get('CRON_TRIGGER_SECRET')
+  const providedSecret = req.headers.get('x-cron-secret')
+
+  if (!expectedSecret) {
+    console.error('CRON_TRIGGER_SECRET ist nicht konfiguriert')
+
+    return new Response(
+      JSON.stringify({ success: false, error: 'Server configuration error' }),
+      {
+        status: 500,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }
+
+  if (!providedSecret || providedSecret !== expectedSecret) {
+    return new Response(
+      JSON.stringify({ success: false, error: 'Unauthorized' }),
+      {
+        status: 401,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }
 
   // Supabase-Client deklarieren (wird auch im catch-Block gebraucht)
   let supabase: any = null;
+  const startTime = Date.now()
+  const collector = new RunErrorCollector()
 
   try {
     console.log("Starte Get_Trigger_Data Edge Function mit erweitertem Logging...");
@@ -73,8 +119,7 @@ Deno.serve(async (req) => {
       ?? Deno.env.get('SUPABASE_SECRET_KEY') 
       ?? ''
     supabase = createClient(supabaseUrl, supabaseSecretKey)
-    const startTime = Date.now()
-    const collector = new RunErrorCollector()
+
 
     // 2. Datumswerte für Deutschland (Berlin) vorbereiten
     const now = new Date();
@@ -271,7 +316,7 @@ Deno.serve(async (req) => {
     for (const [key, group] of groupedWork.entries()) {
       const { existing, newCandidates } = group;
 
-      // REGEL 6: "Falls einer der beiden Status declined oder accepted, muss der stehen bleiben."
+      // REGEL 6: "Falls einer der beiden Status rejected oder accepted, muss der stehen bleiben."
       const finalizedRecord = existing.find(r => 
         ['accepted', 'rejected'].includes(String(r.Trigger_Status).toLowerCase())
       );

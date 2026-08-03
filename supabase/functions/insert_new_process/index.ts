@@ -18,7 +18,7 @@ const corsHeaders = {
 // ==========================================
 // Diesen Block auskommentieren / auf false setzen, sobald die Views
 // echte PII liefern oder wenn produktiv deployed wird.
-const USE_TEST_PII_FALLBACK = false;
+const USE_TEST_PII_FALLBACK = true;
 
 // ==========================================
 // CASE-INSENSITIVE FIELD GETTER
@@ -524,6 +524,11 @@ Deno.serve(async (req) => {
         await supabase
           .from('Trigger_Backlog')
           .update({ extra_info: `process_blocked: ${reasonText}` })
+          .eq('Trigger_Candidate_ID', recId);
+
+        await supabase
+          .from('Trigger_Backlog')
+          .update({ 'Trigger_Status': `rejected` })
           .eq('Trigger_Candidate_ID', recId);
 
         countFailed++;
