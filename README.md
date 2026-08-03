@@ -440,12 +440,18 @@ supabase/.env.local
 ### Supabase
 
 
-| Variable                    | Pflicht                      | Verwendung                                                     |
-| --------------------------- | :----------------------------: | -------------------------------------------------------------- |
-| `SUPABASE_URL`              | Ja                           | URL des Supabase-Projekts                                      |
-| `SUPABASE_SERVICE_ROLE_KEY` | Für die meisten Functions    | Serverzugriff mit RLS-Bypass                                   |
-| `SUPABASE_SECRET_KEY`       | Teilweise Fallback           | Alternative zum Service-Role-Key in mehreren Functions         |
-| `SUPABASE_ANON_KEY`         | Für `submit_reviewed_values` | Erstellt den nutzergebundenen Client für Supabase Auth und RLS |
+| Variable | Pflicht | Verwendung |
+| --- | :---: | --- |
+| `SUPABASE_URL` | Ja | URL des Supabase-Projekts |
+| `SUPABASE_SECRET_KEYS` | Ja | Von Supabase gesetztes JSON-Objekt `{ "<name>": "sb_secret_..." }` |
+| `SECRET_KEY_NAME` | Ja | Name des zu verwendenden Secret Keys, üblicherweise `default` |
+| `SUPABASE_PUBLISHABLE_KEYS` | Für `submit_reviewed_values` | Von Supabase gesetztes JSON-Objekt `{ "<name>": "sb_publishable_..." }` |
+| `PUBLISHABLE_KEY_NAME` | Für `submit_reviewed_values` | Name des zu verwendenden Publishable Keys, üblicherweise `default` |
+
+Die Legacy-Variablen `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_SECRET_KEY` und `SUPABASE_ANON_KEY` werden nicht mehr gelesen.
+
+> [!IMPORTANT]
+> Secret und Publishable Keys sind keine JWTs. Sie gehören ausschließlich in den `apikey`-Header. Wird ein solcher Key zusätzlich als `Authorization: Bearer ...` gesendet, versucht die Plattform ihn als JWT zu parsen und lehnt die Anfrage mit `Invalid JWT` ab. Der `Authorization`-Header bleibt Nutzer-Tokens vorbehalten. Das betrifft auch Database Webhooks und `pg_net`-Aufrufe.
 
 
 ### Token und Portal
@@ -468,12 +474,15 @@ $bytes = New-Object byte[] 32
 ### SendGrid
 
 
-| Variable           | Pflicht            | Verwendung                                           |
-| ------------------ | :------------------: | ---------------------------------------------------- |
+| Variable | Pflicht | Verwendung |
+| --- | :---: | --- |
 | `SENDGRID_API_KEY` | Für Mail-Functions | Versand von Portal-, Reminder- und Bestätigungsmails |
+| `SENDGRID_WEBHOOK_VERIFICATION_KEY` | Für `handle-email-events` | Öffentlicher Verification Key aus dem Signed Event Webhook in SendGrid |
 
 
 Die Template-IDs sind aktuell direkt in den Functions hinterlegt. Änderungen an Branding oder Templates erfordern daher zurzeit eine Codeänderung und ein erneutes Deployment.
+
+Für `handle-email-events` muss in SendGrid **Enable Signed Event Webhook** aktiv sein. Der dort angezeigte Verification Key gehört als Secret `SENDGRID_WEBHOOK_VERIFICATION_KEY` in die Edge Functions.
 
 ### Microsoft Teams
 
