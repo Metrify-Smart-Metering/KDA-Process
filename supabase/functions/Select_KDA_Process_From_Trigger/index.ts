@@ -1,5 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = "Select_KDA_Process_From_Trigger"
 
@@ -171,6 +173,9 @@ Deno.serve(async (req) => {
     return new Response("ok", { headers: corsHeaders })
   }
 
+  const authError = await requireSecretApiKey(req, corsHeaders)
+  if (authError) return authError
+
   let supabase: any = null
   const startTime = Date.now()
   const collector = new RunErrorCollector()
@@ -203,13 +208,8 @@ Deno.serve(async (req) => {
       console.log("[Pipeline] Webhook empfangen: Get_Trigger_Data war erfolgreich! Starte Verarbeitung...")
     }
 
-    // 2) Supabase Client mit Service Role initialisieren
-    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? ""
-    const supabaseSecretKey =
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
-      Deno.env.get("SUPABASE_SECRET_KEY") ??
-      ""
-    supabase = createClient(supabaseUrl, supabaseSecretKey)
+    // 2) Supabase Client mit Secret Key initialisieren (RLS-Bypass)
+    supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
 
     // 3) Heutiges Datum (Europe/Berlin)
     const now = new Date()

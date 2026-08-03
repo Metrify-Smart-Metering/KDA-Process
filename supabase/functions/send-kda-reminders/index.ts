@@ -1,6 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 import { decryptToken } from "../_shared/tokenCrypto.ts"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'send-kda-reminders'
 // ==========================================
@@ -121,23 +123,20 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders })
   }
 
+  const authError = await requireSecretApiKey(req, corsHeaders)
+  if (authError) return authError
+
   try {
     console.log("=== send-kda-reminders Edge Function gestartet ===");
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     const sendgridApiKey = Deno.env.get('SENDGRID_API_KEY')
     const portalUrl = Deno.env.get('PORTAL_URL') || 'https://portal.example.com'
-
-    if (!supabaseUrl || !supabaseServiceRoleKey) {
-      throw new Error('SUPABASE_URL oder SUPABASE_SERVICE_ROLE_KEY fehlt.')
-    }
 
     if (!sendgridApiKey) {
       throw new Error('SENDGRID_API_KEY-Umgebungsvariable ist nicht gesetzt.')
     }
 
-    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
 
     const startTime = Date.now()
     const collector = new RunErrorCollector()
@@ -462,15 +461,15 @@ Deno.serve(async (req) => {
     console.error('Fehler in send-kda-reminders:', error)
 
     // supabase-Client neu aufbauen, falls der Fehler vor dessen Initialisierung auftrat
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    if (supabaseUrl && supabaseServiceRoleKey) {
-      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+    try {
+      const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
       await logPipelineRun(supabase, {
         jobName: JOB_NAME,
         status: 'error',
         fatalErrorMessage: msg
       })
+    } catch (logErr) {
+      console.error('Fehlerlauf konnte nicht protokolliert werden:', logErr instanceof Error ? logErr.message : String(logErr))
     }
 
     return new Response(JSON.stringify({

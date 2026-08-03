@@ -1,4 +1,5 @@
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
+import { getSupabaseSecretKey, getSupabaseUrl } from "./utils/env.ts"
 
 // ==========================================
 // TYPEN
@@ -53,6 +54,7 @@ function redactSensitiveInfo(text: string): string {
   return text
     .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[REDACTED-EMAIL]')
     .replace(/(key|token|password|secret|authorization)\s*[:=]\s*\S+/gi, '$1=[REDACTED]')
+    .replace(/\bsb_(?:secret|publishable)_[A-Za-z0-9_-]+/g, '[REDACTED-API-KEY]')
     .replace(/postgres(ql)?:\/\/\S+/gi, '[REDACTED-CONNECTION-STRING]')
 }
 
@@ -233,18 +235,28 @@ export async function logStartupFailureWithoutSupabase(
   jobName: string,
   errorMessage: string
 ): Promise<void> {
-  const supabaseUrl = Deno.env.get('SUPABASE_URL')
-  const serviceKey =
-    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ??
-    Deno.env.get('SUPABASE_SECRET_KEY')
+  let supabaseUrl: string | null = null
+  let secretKey: string | null = null
 
-  if (supabaseUrl && serviceKey) {
+  // Dieser Pfad laeuft bereits im Fehlerfall - eine unvollstaendige
+  // Konfiguration darf ihn nicht zusaetzlich zum Werfen bringen.
+  try {
+    supabaseUrl = getSupabaseUrl()
+    secretKey = getSupabaseSecretKey()
+  } catch (err) {
+    console.error(
+      '[Notfall-Logging] Supabase-Konfiguration unvollstaendig:',
+      err instanceof Error ? err.message : String(err)
+    )
+  }
+
+  if (supabaseUrl && secretKey) {
     try {
       await fetch(`${supabaseUrl}/rest/v1/pipeline_control`, {
         method: 'POST',
         headers: {
-          'apikey': serviceKey,
-          'Authorization': `Bearer ${serviceKey}`,
+          // Secret Keys sind keine JWTs: nur `apikey`, niemals `Authorization`.
+          'apikey': secretKey,
           'Content-Type': 'application/json',
           'Prefer': 'return=minimal'
         },
@@ -260,7 +272,7 @@ export async function logStartupFailureWithoutSupabase(
       console.error('[Notfall-Logging-Fehler] Konnte pipeline_control nicht per REST beschreiben:', err)
     }
   } else {
-    console.error('[Notfall-Logging] Keine SUPABASE_URL/Key vorhanden - kann nicht mal per REST loggen.')
+    console.error('[Notfall-Logging] Keine Supabase-Zugangsdaten vorhanden - kann nicht mal per REST loggen.')
   }
 
   // Teams-Alarm unabhaengig vom Supabase-Log versuchen

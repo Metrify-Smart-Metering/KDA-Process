@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'create_upload_url'
 
@@ -44,13 +45,8 @@ Deno.serve(async (req) => {
       )
     }
 
-    // 4. Supabase-Client initialisieren (Zukunftssicher mit Secret-Modell)
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') 
-      ?? Deno.env.get('SUPABASE_SECRET_KEY') 
-      ?? ''
-    
-    const supabase = createClient(supabaseUrl, supabaseSecretKey)
+    // 4. Supabase-Client initialisieren (Secret-Key-Modell, RLS-Bypass)
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
@@ -160,11 +156,11 @@ Deno.serve(async (req) => {
     )
 
   } catch (err) {
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('SUPABASE_SECRET_KEY') ?? ''
-    if (supabaseUrl && supabaseSecretKey) {
-      const supabase = createClient(supabaseUrl, supabaseSecretKey)
+    try {
+      const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
       await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'error', fatalErrorMessage: err.message })
+    } catch (logErr) {
+      console.error('Fehlerlauf konnte nicht protokolliert werden:', logErr instanceof Error ? logErr.message : String(logErr))
     }
 
     return new Response(

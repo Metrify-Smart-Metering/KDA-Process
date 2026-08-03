@@ -1,6 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'send-kda-teams-report'
 
@@ -102,18 +104,19 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders })
   }
 
+  const authError = await requireSecretApiKey(req, corsHeaders)
+  if (authError) return authError
+
   try {
     console.log("=== send-kda-teams-report Edge Function gestartet (30 Tage Edition + Snowflake Upload) ===");
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const teamsWebhookUrl = Deno.env.get('TEAMS_WEBHOOK_URL');
 
     if (!teamsWebhookUrl) {
       throw new Error("TEAMS_WEBHOOK_URL-Umgebungsvariable ist nicht gesetzt.");
     }
 
-    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey());
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
@@ -971,39 +974,26 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
       errorMessage
     )
 
-    const supabaseUrl =
-      Deno.env.get('SUPABASE_URL') ?? ''
+    try {
+      const supabase = createClient(
+        getSupabaseUrl(),
+        getSupabaseSecretKey()
+      )
 
-    const supabaseServiceRoleKey =
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+      await logPipelineRun(supabase, {
+        jobName: JOB_NAME,
+        status: 'error',
+        fatalErrorMessage: errorMessage
+      })
+    } catch (loggingError: unknown) {
+      const loggingErrorMessage =
+        loggingError instanceof Error
+          ? loggingError.message
+          : String(loggingError)
 
-    if (supabaseUrl && supabaseServiceRoleKey) {
-      try {
-        const supabase = createClient(
-          supabaseUrl,
-          supabaseServiceRoleKey
-        )
-
-        await logPipelineRun(supabase, {
-          jobName: JOB_NAME,
-          status: 'error',
-          fatalErrorMessage: errorMessage
-        })
-      } catch (loggingError: unknown) {
-        const loggingErrorMessage =
-          loggingError instanceof Error
-            ? loggingError.message
-            : String(loggingError)
-
-        console.error(
-          'Fehlerlauf konnte nicht protokolliert werden:',
-          loggingErrorMessage
-        )
-      }
-    } else {
       console.error(
-        'Fehlerlauf konnte nicht protokolliert werden: ' +
-        'SUPABASE_URL oder SUPABASE_SERVICE_ROLE_KEY fehlt.'
+        'Fehlerlauf konnte nicht protokolliert werden:',
+        loggingErrorMessage
       )
     }
 

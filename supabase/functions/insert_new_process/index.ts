@@ -1,6 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'insert_new_process'
 
@@ -139,6 +141,9 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders });
   }
 
+  const authError = await requireSecretApiKey(req, corsHeaders);
+  if (authError) return authError;
+
   // Supabase-Client deklarieren (damit er im catch-Block zur Verfügung steht)
   let supabase: any = null;
   const startTime = Date.now()
@@ -176,13 +181,8 @@ Deno.serve(async (req) => {
       console.log("[Pipeline] Webhook empfangen: Select_KDA_Process_From_Trigger war erfolgreich! Starte Verarbeitung...");
     }
 
-    // 2. Supabase Client mit Service Role initialisieren (RLS-Bypass)
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
-    const supabaseSecretKey =
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ??
-      Deno.env.get('SUPABASE_SECRET_KEY') ??
-      '';
-    supabase = createClient(supabaseUrl, supabaseSecretKey);
+    // 2. Supabase Client mit Secret Key initialisieren (RLS-Bypass)
+    supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey());
  
 
 

@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'submit_process'
 
@@ -185,14 +186,8 @@ Deno.serve(async (req) => {
     }
 
     // 4. Supabase-Client mit Secret-Key initialisieren (RLS-Bypass)
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseSecretKey =
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
-      ?? Deno.env.get('SUPABASE_SECRET_KEY')
-      ?? ''
-
     const sendgridApiKey = Deno.env.get('SENDGRID_API_KEY')
-    const supabase = createClient(supabaseUrl, supabaseSecretKey)
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
@@ -433,11 +428,11 @@ Deno.serve(async (req) => {
   } catch (err) {
     console.error("Kritischer interner Fehler in submit_process:", err);
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('SUPABASE_SECRET_KEY') ?? ''
-    if (supabaseUrl && supabaseSecretKey) {
-      const supabase = createClient(supabaseUrl, supabaseSecretKey)
+    try {
+      const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
       await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'error', fatalErrorMessage: err.message })
+    } catch (logErr) {
+      console.error('Fehlerlauf konnte nicht protokolliert werden:', logErr instanceof Error ? logErr.message : String(logErr))
     }
 
     return new Response(

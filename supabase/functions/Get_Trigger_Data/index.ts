@@ -1,6 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { secretsEqual } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'Get_Trigger_Data'
 
@@ -92,7 +94,7 @@ Deno.serve(async (req) => {
     )
   }
 
-  if (!providedSecret || providedSecret !== expectedSecret) {
+  if (!providedSecret || !(await secretsEqual(providedSecret, expectedSecret))) {
     return new Response(
       JSON.stringify({ success: false, error: 'Unauthorized' }),
       {
@@ -113,12 +115,8 @@ Deno.serve(async (req) => {
   try {
     console.log("Starte Get_Trigger_Data Edge Function mit erweitertem Logging...");
 
-    // 1. Supabase-Client mit Service Role initialisieren
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') 
-      ?? Deno.env.get('SUPABASE_SECRET_KEY') 
-      ?? ''
-    supabase = createClient(supabaseUrl, supabaseSecretKey)
+    // 1. Supabase-Client mit Secret Key initialisieren (RLS-Bypass)
+    supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
 
 
     // 2. Datumswerte für Deutschland (Berlin) vorbereiten

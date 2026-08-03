@@ -1,6 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'evaluate-plausibility'
 
@@ -27,6 +29,10 @@ Deno.serve(async (req) => {
     console.log("🔄 CORS OPTIONS Preflight Request erfolgreich beantwortet.");
     return new Response('ok', { headers: corsHeaders })
   }
+
+  const authError = await requireSecretApiKey(req, corsHeaders)
+  if (authError) return authError
+
   // Wird für Recovery und Fehler-Logging außerhalb des Haupt-try benötigt.
   let processId: string | number | null = null;
 
@@ -78,12 +84,7 @@ Deno.serve(async (req) => {
     }
 
     // ---------- 3. Supabase ----------
-    const supabaseUrl = Deno.env.get('SUPABASE_URL');
-    const supabaseSecretKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SECRET_KEY');
-    if (!supabaseUrl || !supabaseSecretKey) {
-      throw new Error("Fehlende Supabase-Umgebungsvariablen!");
-    }
-    const supabase = createClient(supabaseUrl, supabaseSecretKey);
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey());
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
@@ -414,45 +415,34 @@ Deno.serve(async (req) => {
     // Wichtig: Den Request-Body hier nicht erneut lesen. Er wurde bereits mit
     // req.text() verbraucht.
     try {
-      const supabaseUrl = Deno.env.get('SUPABASE_URL');
-      const supabaseSecretKey =
-        Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ||
-        Deno.env.get('SUPABASE_SECRET_KEY');
+      const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey());
 
-      if (!supabaseUrl || !supabaseSecretKey) {
-        console.error(
-          "🚨 Recovery nicht möglich: Supabase-Umgebungsvariablen fehlen."
-        );
-      } else {
-        const supabase = createClient(supabaseUrl, supabaseSecretKey);
+      if (processId !== null) {
+        const { error: recoveryError } = await supabase
+          .from('Process_Database')
+          .update({ kda_status: 4 })
+          .eq('id', processId);
 
-        if (processId !== null) {
-          const { error: recoveryError } = await supabase
-            .from('Process_Database')
-            .update({ kda_status: 4 })
-            .eq('id', processId);
-
-          if (recoveryError) {
-            console.error(
-              `🚨 Recovery-Update für Process-ID ${processId} fehlgeschlagen: ${recoveryError.message}`
-            );
-          }
-        } else {
-          console.warn(
-            "⚠️ Keine Process-ID verfügbar; Status konnte nicht auf 9 gesetzt werden."
+        if (recoveryError) {
+          console.error(
+            `🚨 Recovery-Update für Process-ID ${processId} fehlgeschlagen: ${recoveryError.message}`
           );
         }
-
-        // status='error' löst in logging.ts den Teams-Alarm aus.
-        // Das Logging wird auch ausgeführt, wenn keine Process-ID verfügbar ist.
-        await logPipelineRun(supabase, {
-          jobName: JOB_NAME,
-          status: 'error',
-          fatalErrorMessage: processId !== null
-            ? `${errorMessage} | process_id=${processId}`
-            : errorMessage
-        });
+      } else {
+        console.warn(
+          "⚠️ Keine Process-ID verfügbar; Status konnte nicht auf 9 gesetzt werden."
+        );
       }
+
+      // status='error' löst in logging.ts den Teams-Alarm aus.
+      // Das Logging wird auch ausgeführt, wenn keine Process-ID verfügbar ist.
+      await logPipelineRun(supabase, {
+        jobName: JOB_NAME,
+        status: 'error',
+        fatalErrorMessage: processId !== null
+          ? `${errorMessage} | process_id=${processId}`
+          : errorMessage
+      });
     } catch (recoveryError) {
       // Nicht mehr stumm verschlucken: Sonst ist nicht erkennbar,
       // warum pipeline_control oder der Teams-Alarm nicht erreicht wurde.

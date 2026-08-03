@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 
 const JOB_NAME = 'open_process'
@@ -40,14 +41,11 @@ Deno.serve(async (req) => {
       )
     }
 
-    // 3. Supabase-Client mit Service-Role initialisieren
-    // Wir nutzen hier den SERVICE_ROLE_KEY, da dieser RLS umgeht.
-    // Das ist sicher, weil dieser Code ausschließlich auf den sicheren Servern 
-    // von Supabase läuft und niemals für den Kunden im Browser sichtbar ist.
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    
-    const supabase = createClient(supabaseUrl, supabaseServiceKey)
+    // 3. Supabase-Client mit Secret-Key initialisieren
+    // Der Secret Key umgeht RLS. Das ist sicher, weil dieser Code ausschließlich
+    // auf den sicheren Servern von Supabase läuft und niemals für den Kunden
+    // im Browser sichtbar ist.
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
@@ -186,11 +184,11 @@ Deno.serve(async (req) => {
     )
 
   } catch (err) {
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    if (supabaseUrl && supabaseServiceKey) {
-      const supabase = createClient(supabaseUrl, supabaseServiceKey)
+    try {
+      const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
       await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'error', fatalErrorMessage: err.message })
+    } catch (logErr) {
+      console.error('Fehlerlauf konnte nicht protokolliert werden:', logErr instanceof Error ? logErr.message : String(logErr))
     }
 
     // Falls ein unerwarteter Systemfehler auftritt

@@ -1,5 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
+import { verifySendGridEventWebhook } from "../_shared/utils/sendgridWebhook.ts"
 
 const JOB_NAME = 'handle-email-events'
 
@@ -8,7 +10,7 @@ const JOB_NAME = 'handle-email-events'
 // ==========================================
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-twilio-email-event-webhook-signature, x-twilio-email-event-webhook-timestamp',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
@@ -27,20 +29,35 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders });
   }
 
+  // Raw Body zuerst lesen: ECDSA-Signatur gilt nur für die unveränderten Bytes.
+  const rawBody = await req.text();
+
+  const signatureCheck = await verifySendGridEventWebhook(req, rawBody);
+  if (!signatureCheck.ok) {
+    return new Response(JSON.stringify({ success: false, error: signatureCheck.error }), {
+      status: signatureCheck.status,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
   try {
     console.log("=== handle_email_events Edge Function gestartet ===");
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    
-    // Supabase-Client mit Service-Role initialisieren (umgeht RLS)
-    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+    // Supabase-Client mit Secret Key initialisieren (umgeht RLS)
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey());
     const startTime = Date.now()
     const collector = new RunErrorCollector()
     let relevantEventCount = 0
 
     // SendGrid sendet Events immer als JSON-Array
-    const events = await req.json();
+    const events = JSON.parse(rawBody);
+    if (!Array.isArray(events)) {
+      return new Response(JSON.stringify({ success: false, error: "Expected a JSON array of events." }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     console.log(`[SendGrid Webhook] ${events.length} Events empfangen.`);
 
     for (const event of events) {
@@ -128,15 +145,15 @@ Deno.serve(async (req) => {
   } catch (error) {
     console.error("Kritischer Fehler im handle_email_events Webhook-Handler:", error);
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    if (supabaseUrl && supabaseServiceRoleKey) {
-      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+    try {
+      const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
       await logPipelineRun(supabase, {
         jobName: JOB_NAME,
         status: 'error',
         fatalErrorMessage: error.message
       })
+    } catch (logErr) {
+      console.error('Fehlerlauf konnte nicht protokolliert werden:', logErr instanceof Error ? logErr.message : String(logErr))
     }
 
     // Auch bei Fehlern geben wir für SendGrid ein 200 zurück (bzw. fangen den Fehler im Log ab),

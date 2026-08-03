@@ -1,6 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 import { encryptToken } from "../_shared/tokenCrypto.ts"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'send-portal-link'
 
@@ -41,11 +43,12 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders });
   }
 
+  const authError = await requireSecretApiKey(req, corsHeaders);
+  if (authError) return authError;
+
   try {
     console.log("=== send-portal-link Edge Function gestartet (SendGrid Template Mode) ===");
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const sendgridApiKey = Deno.env.get('SENDGRID_API_KEY');
     const portalUrl = Deno.env.get('PORTAL_URL') || 'https://portal.example.com';
 
@@ -53,8 +56,8 @@ Deno.serve(async (req) => {
       throw new Error("SENDGRID_API_KEY-Umgebungsvariable ist nicht gesetzt.");
     }
 
-    // Supabase-Client mit Service-Role initialisieren (umgeht RLS)
-    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+    // Supabase-Client mit Secret Key initialisieren (umgeht RLS)
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey());
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
@@ -361,15 +364,15 @@ Deno.serve(async (req) => {
   } catch (error) {
     console.error("Fehler in der Edge-Function send-portal-link:", error);
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    if (supabaseUrl && supabaseServiceRoleKey) {
-      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+    try {
+      const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
       await logPipelineRun(supabase, {
         jobName: JOB_NAME,
         status: 'error',
         fatalErrorMessage: error.message
       })
+    } catch (logErr) {
+      console.error('Fehlerlauf konnte nicht protokolliert werden:', logErr instanceof Error ? logErr.message : String(logErr))
     }
 
     return new Response(JSON.stringify({ error: error.message }), {

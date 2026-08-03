@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun } from "../_shared/logging.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'weekly-kda-report-callback'
 const CSV_BUCKET = 'kda_upload_csv'
@@ -396,6 +397,10 @@ function sanitizeForLogging(
       /\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b/g,
       '[REDACTED-JWT]',
     )
+    .replace(
+      /\bsb_(?:secret|publishable)_[A-Za-z0-9_-]+/g,
+      '[REDACTED-API-KEY]',
+    )
 
   return truncateText(sanitized)
 }
@@ -548,12 +553,6 @@ Deno.serve(async (req) => {
     )
   }
 
-  const supabaseUrl =
-    Deno.env.get('SUPABASE_URL')
-
-  const supabaseServiceRoleKey =
-    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
-
   const reportWebhookSecret =
     Deno.env.get('REPORT_WEBHOOK_SECRET')
 
@@ -562,9 +561,6 @@ Deno.serve(async (req) => {
     requestId,
     'configuration_checked',
     {
-      supabase_url_present: Boolean(supabaseUrl),
-      service_role_key_present:
-        Boolean(supabaseServiceRoleKey),
       report_webhook_secret_present:
         Boolean(reportWebhookSecret),
     },
@@ -573,6 +569,10 @@ Deno.serve(async (req) => {
   let supabase:
     | ReturnType<typeof createClient>
     | null = null
+
+  // Wird beim Client-Aufbau gesetzt und dient danach als bekanntes Secret,
+  // das aus allen Log-Ausgaben herausredigiert wird.
+  let supabaseSecretKey: string | undefined
 
   let callbackDurationMs: number | null = null
 
@@ -638,15 +638,11 @@ Deno.serve(async (req) => {
       'authentication_succeeded',
     )
 
-    if (!supabaseUrl || !supabaseServiceRoleKey) {
-      throw new Error(
-        'SUPABASE_URL oder SUPABASE_SERVICE_ROLE_KEY fehlt.',
-      )
-    }
+    supabaseSecretKey = getSupabaseSecretKey()
 
     supabase = createClient(
-      supabaseUrl,
-      supabaseServiceRoleKey,
+      getSupabaseUrl(),
+      supabaseSecretKey,
     )
 
     logEvent(
@@ -781,7 +777,7 @@ Deno.serve(async (req) => {
               errorToString(updateError),
               [
                 reportWebhookSecret,
-                supabaseServiceRoleKey,
+                supabaseSecretKey,
               ],
             )
 
@@ -906,7 +902,7 @@ Deno.serve(async (req) => {
                 errorToString(cleanupError),
                 [
                   reportWebhookSecret,
-                  supabaseServiceRoleKey,
+                  supabaseSecretKey,
                 ],
               )
 
@@ -937,7 +933,7 @@ Deno.serve(async (req) => {
               errorToString(cleanupError),
               [
                 reportWebhookSecret,
-                supabaseServiceRoleKey,
+                supabaseSecretKey,
               ],
             )
 
@@ -995,7 +991,7 @@ Deno.serve(async (req) => {
         ),
         [
           reportWebhookSecret,
-          supabaseServiceRoleKey,
+          supabaseSecretKey,
         ],
       )
 
@@ -1057,7 +1053,7 @@ Deno.serve(async (req) => {
         errorToString(error),
         [
           reportWebhookSecret,
-          supabaseServiceRoleKey,
+          supabaseSecretKey,
         ],
       )
 
@@ -1107,7 +1103,7 @@ Deno.serve(async (req) => {
             errorToString(loggingError),
             [
               reportWebhookSecret,
-              supabaseServiceRoleKey,
+              supabaseSecretKey,
             ],
           )
 

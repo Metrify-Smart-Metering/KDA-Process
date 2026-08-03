@@ -1,8 +1,10 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "content-type",
+  "Access-Control-Allow-Headers": "apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 }
 
@@ -69,6 +71,9 @@ Deno.serve(async (req: Request) => {
     return new Response("ok", { headers: corsHeaders })
   }
 
+  const authError = await requireSecretApiKey(req, corsHeaders)
+  if (authError) return authError
+
   if (req.method !== "POST") {
     return jsonResponse(405, {
       success: false,
@@ -95,25 +100,21 @@ Deno.serve(async (req: Request) => {
     })
   }
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? ""
-  const serviceRoleKey =
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
-    Deno.env.get("SUPABASE_SECRET_KEY") ??
-    ""
-
-  if (!supabaseUrl || !serviceRoleKey) {
+  let supabase: ReturnType<typeof createClient>
+  try {
+    supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey(), {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+      },
+    })
+  } catch (envError) {
+    console.error("Supabase-Konfiguration unvollstaendig:", envError instanceof Error ? envError.message : String(envError))
     return jsonResponse(500, {
       success: false,
       error: "Supabase environment variables are missing",
     })
   }
-
-  const supabase = createClient(supabaseUrl, serviceRoleKey, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    },
-  })
 
   const startedAt = Date.now()
 

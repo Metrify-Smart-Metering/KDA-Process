@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -13,6 +14,9 @@ serve(async (req) => {
     return new Response('ok', { headers: corsHeaders })
   }
 
+  const authError = await requireSecretApiKey(req, corsHeaders)
+  if (authError) return authError
+
   try {
     console.log("Starte Snowflake-Verbindungstest...");
 
@@ -25,13 +29,6 @@ serve(async (req) => {
         CURRENT_ROLE() as current_role,
         CURRENT_WAREHOUSE() as current_warehouse
     `;
-
-    const key = Deno.env.get("SNOWFLAKE_PRIMARY_PRIVATE_KEY") ?? "";
-    console.log("PRIVATE_KEY length:", key.length);
-    console.log("has BEGIN:", key.includes("-----BEGIN"));
-    console.log("has END:", key.includes("-----END"));
-    console.log("has ENCRYPTED PRIVATE KEY:", key.includes("ENCRYPTED PRIVATE KEY"));
-
 
     // Führt die Abfrage auf der 'primary' Instanz aus
     const result = await executeSnowflakeQuery('primary', sqlQuery);
@@ -49,12 +46,12 @@ serve(async (req) => {
 
   } catch (error) {
     console.error("Kritischer Fehler beim Snowflake-Verbindungstest:", error);
-    
-    // Wir geben detaillierte Fehler-Infos zurück, um das Debugging (z.B. falsches Secret) zu erleichtern
+
+    // Stacktrace nur ins Log, nicht in die Antwort: Die Function laeuft mit
+    // verify_jwt = false und ist damit ohne Auth erreichbar.
     return new Response(JSON.stringify({
       success: false,
       error_message: error.message,
-      error_stack: error.stack,
       hint: "Prüfen Sie, ob alle SNOWFLAKE_PRIMARY_* Secrets korrekt gesetzt sind und die Netzwerkfreigabe in Snowflake aktiv ist."
     }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },

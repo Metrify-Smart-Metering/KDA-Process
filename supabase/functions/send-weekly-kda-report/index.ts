@@ -1,5 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { requireSecretApiKey } from "../_shared/utils/auth.ts"
+import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 // ==========================================
 // CORS HEADERS
@@ -94,8 +96,8 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders })
   }
 
-  const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-  const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+  const authError = await requireSecretApiKey(req, corsHeaders)
+  if (authError) return authError
 
   try {
     console.log("=== send-weekly-kda-report gestartet ===")
@@ -106,7 +108,7 @@ Deno.serve(async (req) => {
     if (!powerAutomateWebhookUrl) throw new Error('POWER_AUTOMATE_WEBHOOK_URL ist nicht gesetzt.')
     if (!reportWebhookSecret) throw new Error('REPORT_WEBHOOK_SECRET ist nicht gesetzt.')
 
-    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+    const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
@@ -338,8 +340,8 @@ Deno.serve(async (req) => {
 
     try {
       const supabase = createClient(
-        supabaseUrl,
-        supabaseServiceRoleKey
+        getSupabaseUrl(),
+        getSupabaseSecretKey()
       )
 
       await logPipelineRun(supabase, {

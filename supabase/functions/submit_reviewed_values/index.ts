@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { getSupabasePublishableKey, getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'submit_reviewed_values'
 
@@ -22,9 +23,19 @@ Deno.serve(async (req) => {
       })
     }
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') ?? ''
-    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    // Authorization ist ausschliesslich fuer das Nutzer-JWT vorgesehen. Ein
+    // dort durchgereichter API Key waere kein gueltiger Nutzerkontext und
+    // wuerde spaeter nur eine unverstaendliche "Invalid JWT"-Antwort erzeugen.
+    const bearerToken = authHeader.replace(/^Bearer\s+/i, '').trim()
+    if (bearerToken.startsWith('sb_publishable_') || bearerToken.startsWith('sb_secret_')) {
+      return new Response(JSON.stringify({ error: 'Authorization muss ein Nutzer-Token enthalten, keinen API Key.' }), {
+        status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
+    }
+
+    // Publishable Key im `apikey`-Header, Nutzer-JWT im `Authorization`-Header:
+    // dadurch greifen die RLS-Policies des eingeloggten Nutzers.
+    const supabase = createClient(getSupabaseUrl(), getSupabasePublishableKey(), {
       global: { headers: { Authorization: authHeader } }
     })
     const startTime = Date.now()
@@ -173,11 +184,11 @@ Deno.serve(async (req) => {
     })
 
   } catch (err) {
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    if (supabaseUrl && supabaseServiceRoleKey) {
-      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+    try {
+      const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey())
       await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'error', fatalErrorMessage: err.message })
+    } catch (logErr) {
+      console.error('Fehlerlauf konnte nicht protokolliert werden:', logErr instanceof Error ? logErr.message : String(logErr))
     }
 
     return new Response(JSON.stringify({ error: 'Interner Serverfehler', details: err.message }), {
