@@ -131,7 +131,7 @@ Deno.serve(async (req) => {
     const { data: uploadData, error: uploadError } = await supabase
       .storage
       .from('meter-readings_pics')
-      .createSignedUploadUrl(storagePath)
+      .createSignedUploadUrl(storagePath, { upsert: true })
 
     if (uploadError || !uploadData) {
       collector.error(`Upload-Freigabe fehlgeschlagen: ${uploadError?.message}`, { process_id, obis_code })
