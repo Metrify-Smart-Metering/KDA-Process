@@ -198,9 +198,10 @@ export async function logPipelineRun(
     collector?: RunErrorCollector
     fatalErrorMessage?: string | null
     durationMs?: number | null
+    context?: Record<string, unknown> | null
   }
 ): Promise<void> {
-  const { jobName, status, collector, fatalErrorMessage, durationMs } = params
+  const { jobName, status, collector, fatalErrorMessage, durationMs, context } = params
 
   try {
     const { error } = await supabase.from('pipeline_control').insert({
@@ -209,6 +210,7 @@ export async function logPipelineRun(
       error_message: status === 'error' ? fatalErrorMessage ?? null : null,
       errors: collector?.all ?? [],
       duration_ms: durationMs ?? null,
+      context: context ?? null,
       finished_at: new Date().toISOString()
     })
 

@@ -32,12 +32,21 @@ export type SnowflakeSqlApiRowType = {
   name: string;
 };
 
+/** Ergebnisse jenseits von Partition 0 muessen einzeln abgeholt werden. */
+export type SnowflakeSqlApiPartitionInfo = {
+  rowCount?: number;
+  uncompressedSize?: number;
+};
+
 export type SnowflakeSqlApiStatementPayload = {
   code?: string;
   message?: string;
   data?: unknown[][];
+  statementHandle?: string;
   statementStatusUrl?: string;
   resultSetMetaData?: {
+    numRows?: number;
     rowType?: SnowflakeSqlApiRowType[];
+    partitionInfo?: SnowflakeSqlApiPartitionInfo[];
   };
 };
