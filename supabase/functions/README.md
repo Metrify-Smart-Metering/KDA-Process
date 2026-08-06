@@ -23,9 +23,15 @@ Das Projekt besteht aus **Supabase Edge Functions**, die Trigger-Daten aus **Sno
 
 Die bereitgestellte Codebase ist als Sammlung unabhängig deploybarer **Supabase Edge Functions** organisiert. Jede Funktion besitzt einen eigenen Einstiegspunkt und kann separat ausgelöst, getestet und veröffentlicht werden. Wiederverwendbare Infrastruktur liegt unter `_shared`.
 
+Postgres-RPCs der Pipeline (Catch/Select/Insert) liegen unter
+`supabase/database_functions/` und werden per
+`supabase db query --linked -f …` bzw. `.\supabase\database_functions\deploy.ps1`
+deployt — nicht über Edge-Function-Deploy und nicht über neue Migrations.
+
 ```text
 KDA-Process/
 └── supabase/
+    ├── database_functions/   # Postgres-RPCs (Source of Truth)
     └── functions/
         ├── _shared/
         │   ├── logging.ts

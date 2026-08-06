@@ -30,8 +30,8 @@ function formatDateDE(value: string | Date | null): string {
   return `${day}.${month}.${year}`
 }
 
-// Zahl im internationalen Format (Punkt als Dezimaltrennzeichen),
-// da Komma das Spaltentrennzeichen der CSV ist
+// Zahl im internationalen Format (Punkt als Dezimaltrennzeichen);
+// Spaltentrennzeichen der CSV ist Semikolon
 function formatNumber(value: number | null): string {
   if (value === null || value === undefined || isNaN(value)) return ''
   return String(value)
@@ -79,8 +79,8 @@ function buildCsvRows(row: {
   ]
 
   return [
-    base(row.cons_val, '1-0:1.8.0').join(','),
-    base(row.prod_val, '1-0:2.8.0').join(',')
+    base(row.cons_val, '1-0:1.8.0').join(';'),
+    base(row.prod_val, '1-0:2.8.0').join(';')
   ]
 }
 
