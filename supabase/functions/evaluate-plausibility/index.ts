@@ -109,10 +109,6 @@ Deno.serve(async (req) => {
       .eq('id', record.id)
       .single();
        
-    if (!processData.customer_label) {
-      throw new Error(`Dem alten Prozess ${record.id} fehlt customer_label.`);
-    }
-
     if (processError) {
       console.error("❌ [DB ERROR] Fehler beim Laden der Process_Database / Customer_PII:");
       console.error(JSON.stringify(processError, null, 2));
@@ -122,6 +118,10 @@ Deno.serve(async (req) => {
     if (!processData) {
       console.error(`❌ [DB ERROR] Kein Eintrag in Process_Database gefunden für ID: ${record.id}`);
       throw new Error("Prozess-Datensatz existiert nicht.");
+    }
+
+    if (!processData.customer_label) {
+      throw new Error(`Dem alten Prozess ${record.id} fehlt customer_label.`);
     }
 
     const piiRaw = processData.Customer_PII;
@@ -411,31 +411,16 @@ Deno.serve(async (req) => {
       errorStack ?? errorMessage
     );
 
-    // Recovery: auf Status 9 setzen, damit der Prozess nicht in Status 4 hängenbleibt.
+    // Der Prozess bleibt bewusst auf kda_status = 4. Status 4 bedeutet damit
+    // "eingereicht, Plausibilitätsprüfung noch nicht abgeschlossen". Der
+    // nächtliche Cron (retry_open_plausibility_checks) schickt alle offenen
+    // Status-4-Prozesse erneut durch die Prüfung.
     // Wichtig: Den Request-Body hier nicht erneut lesen. Er wurde bereits mit
     // req.text() verbraucht.
     try {
       const supabase = createClient(getSupabaseUrl(), getSupabaseSecretKey());
 
-      if (processId !== null) {
-        const { error: recoveryError } = await supabase
-          .from('Process_Database')
-          .update({ kda_status: 4 })
-          .eq('id', processId);
-
-        if (recoveryError) {
-          console.error(
-            `🚨 Recovery-Update für Process-ID ${processId} fehlgeschlagen: ${recoveryError.message}`
-          );
-        }
-      } else {
-        console.warn(
-          "⚠️ Keine Process-ID verfügbar; Status konnte nicht auf 9 gesetzt werden."
-        );
-      }
-
       // status='error' löst in logging.ts den Teams-Alarm aus.
-      // Das Logging wird auch ausgeführt, wenn keine Process-ID verfügbar ist.
       await logPipelineRun(supabase, {
         jobName: JOB_NAME,
         status: 'error',

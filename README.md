@@ -198,6 +198,9 @@ Die Tabelle beziehungsweise Struktur `supabase_functions.hooks` dient als **Audi
 | 3   | `0 4 * * 1-5` | Montag bis Freitag um 04:00 Uhr | HTTP-POST auf `/functions/v1/Get_Trigger_Data`       |
 | 4   | `0 7 * * 1`   | Montag um 07:00 Uhr             | HTTP-POST auf `/functions/v1/send-weekly-kda-report` |
 | 5   | `15 3 * * 7`  | Sonntag um 03:15 Uhr            | Führt `select public.delete_old_customer_pii();` aus |
+| 6   | `0 2 * * *`   | Täglich um 02:00 UTC            | Führt `select public.retry_open_plausibility_checks();` aus |
+
+Job 6 schickt alle Prozesse mit `kda_status = 4` erneut durch `evaluate-plausibility`. Status 4 ist ein Durchgangsstatus; bleibt ein Prozess dort liegen (z. B. weil der einmalige Trigger-Aufruf ausgefallen ist), wird er in der Nacht nachgeholt.
 
 
 > [!IMPORTANT]
@@ -410,6 +413,8 @@ Die folgenden Statuswerte sind in den bereitgestellten Functions und im Teams-Re
 | Workflow/Export   | Microsoft Power Automate                                         | Verarbeitung des wöchentlichen CSV-/Fall-Exports                          |
 | Kryptografie      | Web Crypto API, AES-256-GCM, SHA-256                             | Token-Verschlüsselung und sicherer Token-Vergleich                        |
 | Libraries         | `@supabase/supabase-js@2.39.8`, `jose@5.9.6`, `node-forge@1.3.1` | Supabase-Zugriff und Snowflake-JWT-Erstellung                             |
+
+Ausnahme: `create_upload_url` nutzt `@supabase/supabase-js@2.45.4`. Erst diese Version bündelt `storage-js@2.7.0`, in der `createSignedUploadUrl` die `upsert`-Option unterstützt. In der älteren `2.39.8` wird die Option stillschweigend verworfen, sodass ein erneuter Upload-Versuch für denselben Pfad an `The resource already exists` scheitert.
 
 
 ## ✅ Voraussetzungen

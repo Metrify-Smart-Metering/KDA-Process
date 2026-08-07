@@ -15,7 +15,7 @@ const corsHeaders = {
 // Zwei Snowflake-Queries pro Kandidat: Batch klein halten (150s Timeout).
 const CLAIM_BATCH_SIZE = 50
 
-const USE_TEST_PII_FALLBACK = true
+const USE_TEST_PII_FALLBACK = false
 
 const MELO_PATTERN = /^[A-Za-z0-9\-_.]{1,64}$/
 
@@ -44,6 +44,14 @@ function assertValidMelo(melo: string): void {
   if (!MELO_PATTERN.test(melo)) {
     throw new Error(`Ungueltiges Melo-Format, Abbruch aus Sicherheitsgruenden: '${melo}'`)
   }
+}
+
+/** Deutsche PLZ: genau 5 Ziffern, keine Auffüllung führender Nullen. */
+function normalizeGermanPlz(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null
+  const digits = String(raw).trim()
+  if (!/^\d{5}$/.test(digits)) return null
+  return digits
 }
 
 async function fetchCustomerPii(melo: string): Promise<any | null> {
@@ -337,7 +345,7 @@ Deno.serve(async (req) => {
       let customerFirstName = getField(piiRow, ["customer_f_name", "customer_first_name", "first_name", "f_name"])
       let customerLastName = getField(piiRow, ["customer_l_name", "customer_last_name", "last_name", "l_name"])
       let customerSalutation = getField(piiRow, ["customer_salutation", "salutation", "anrede"])
-      let customerPlz = getField(piiRow, ["customer_plz", "plz", "zip", "postcode", "zip_code"])
+      let customerPlzRaw = getField(piiRow, ["customer_plz", "plz", "zip", "postcode", "zip_code"])
       const customerLabel = getField(piiRow, ["customer_label", "brand_key", "brand"])
       const meterNumberFromPii = getField(piiRow, ["meter_number", "zaehlernummer", "meter", "meter_no"])
 
@@ -362,14 +370,17 @@ Deno.serve(async (req) => {
         customerMail = viewMail ?? "erik.beiersdorf@enpal.de"
         customerFirstName = viewFirstName ?? "Erik"
         customerLastName = viewLastName ?? "Beiersdorf"
-        customerPlz = viewPlz ?? "22395"
+        customerPlzRaw = viewPlz ?? "22395"
         customerSalutation = viewSalutation ?? customerSalutation ?? "Herr"
       }
+
+      const customerPlz = normalizeGermanPlz(customerPlzRaw)
 
       const missingReasons: string[] = []
       if (!piiRow) missingReasons.push("keine PII-Daten in customer_register gefunden")
       if (!customerMail) missingReasons.push("E-Mail-Adresse fehlt")
-      if (!customerPlz) missingReasons.push("PLZ fehlt")
+      if (!customerPlzRaw) missingReasons.push("PLZ fehlt")
+      else if (!customerPlz) missingReasons.push(`PLZ ungueltig (muss 5 Ziffern sein): '${String(customerPlzRaw).trim()}'`)
 
       if (missingReasons.length > 0) {
         const reasonText = missingReasons.join("; ")

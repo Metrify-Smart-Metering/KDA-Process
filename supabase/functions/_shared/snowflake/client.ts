@@ -13,6 +13,15 @@ const POLL_ATTEMPTS = 40;
 const POLL_DELAY_MIN_MS = 500;
 const POLL_DELAY_MAX_MS = 2000;
 
+// Snowflake meldet "laeuft noch" ueber mehrere Codes (HTTP 202). Fehlt einer davon
+// hier, wird ein laufendes Statement faelschlich als fataler Fehler geworfen.
+const SNOWFLAKE_IN_PROGRESS_CODES = [
+  "333333", // Statement wird noch ausgefuehrt
+  "333334", // Asynchronous execution in progress
+  "333335", // Statement wurde noch nicht gestartet (queued)
+  "090001",
+];
+
 async function authorizationHeader(config: SnowflakeInstanceConfig): Promise<string> {
   const token = await getSnowflakeJwt(config);
   return `Bearer ${token}`;
@@ -112,7 +121,7 @@ async function awaitCompletion(
       return result;
     }
 
-    if (result.code && !["333333", "090001"].includes(result.code)) {
+    if (result.code && !SNOWFLAKE_IN_PROGRESS_CODES.includes(result.code)) {
       throw new Error(result.message ?? "Snowflake statement failed");
     }
   }

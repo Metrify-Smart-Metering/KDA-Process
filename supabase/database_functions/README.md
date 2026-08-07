@@ -57,4 +57,5 @@ supabase db query --local -f supabase/database_functions/select_kda_backlog.sql
 | `set_process_melo.sql` | Trigger auf `Process_Database` |
 | `release_backlog_on_process_delete.sql` | Trigger auf `Process_Database` |
 | `delete_pii_on_completion.sql` | Trigger auf `Process_Database` |
+| `retry_open_plausibility_checks.sql` | `pg_cron` (`retry-open-plausibility`) |
 | `_00_security_harden.sql` | Grants / RLS (Advisor) |

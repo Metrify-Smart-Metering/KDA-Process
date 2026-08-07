@@ -5,6 +5,17 @@ import { requireSecretApiKey } from "../_shared/utils/auth.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
 const JOB_NAME = 'send-kda-teams-report'
+const CSV_BUCKET = 'kda_upload_csv'
+const SIGNED_URL_TTL_SECONDS = 60 * 60 * 24 * 365 // 1 Jahr
+const BOUNCE_PREVIEW_LIMIT = 5
+const MISSING_EMAIL_PREVIEW_LIMIT = 10
+
+type ReportFile = {
+  bucket: string
+  path: string
+  file_name: string
+  download_url: string
+}
 
 // ==========================================
 // CORS HEADERS
@@ -94,6 +105,89 @@ function formatSqlTimestamp(val: any): string {
 function formatSqlNumber(val: any): string {
   if (val === null || val === undefined || isNaN(Number(val))) return "NULL";
   return String(Number(val));
+}
+
+function csvEscape(value: string | number | null | undefined): string {
+  const s = value === null || value === undefined ? '' : String(value)
+  if (/[;"\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+  return s
+}
+
+function buildSemicolonCsv(headers: string[], rows: Array<Array<string | number | null | undefined>>): string {
+  const lines = [
+    headers.map(csvEscape).join(';'),
+    ...rows.map(row => row.map(csvEscape).join(';')),
+  ]
+  return lines.join('\r\n')
+}
+
+function getPiiField(pii: unknown, field: string): string | null {
+  if (!pii) return null
+  const row = Array.isArray(pii) ? pii[0] : pii
+  if (!row || typeof row !== 'object') return null
+  const value = (row as Record<string, unknown>)[field]
+  if (value === null || value === undefined) return null
+  const trimmed = String(value).trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+async function uploadCsvReport(
+  supabase: ReturnType<typeof createClient>,
+  reportDateIso: string,
+  jobId: string,
+  fileName: string,
+  csvBody: string,
+): Promise<ReportFile> {
+  const storagePath = `teams-report/${reportDateIso}/${jobId}/${fileName}`
+  const csvBytes = new TextEncoder().encode(`\uFEFF${csvBody}`)
+
+  const { error: uploadError } = await supabase.storage
+    .from(CSV_BUCKET)
+    .upload(storagePath, csvBytes, {
+      contentType: 'text/csv; charset=utf-8',
+      upsert: false,
+    })
+
+  if (uploadError) {
+    throw new Error(
+      `CSV konnte nicht in Supabase Storage hochgeladen werden (${fileName}): ${uploadError.message}`,
+    )
+  }
+
+  const { data: signedUrlData, error: signedUrlError } = await supabase.storage
+    .from(CSV_BUCKET)
+    .createSignedUrl(storagePath, SIGNED_URL_TTL_SECONDS)
+
+  if (signedUrlError || !signedUrlData?.signedUrl) {
+    throw new Error(
+      `Signed URL konnte nicht erstellt werden (${fileName}): ${
+        signedUrlError?.message ?? 'Keine URL zurückgegeben'
+      }`,
+    )
+  }
+
+  console.log(`[Storage] CSV hochgeladen: ${storagePath}`)
+
+  return {
+    bucket: CSV_BUCKET,
+    path: storagePath,
+    file_name: fileName,
+    download_url: signedUrlData.signedUrl,
+  }
+}
+
+function downloadActionSet(title: string, url: string) {
+  return {
+    type: 'ActionSet',
+    spacing: 'Small',
+    actions: [
+      {
+        type: 'Action.OpenUrl',
+        title,
+        url,
+      },
+    ],
+  }
 }
 
 // ==========================================
@@ -421,6 +515,82 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
     const bouncedCount = activeBounces.length;
     const hasBounces = bouncedCount > 0;
 
+    const reportDateIso = new Date().toISOString().slice(0, 10)
+    const reportJobId = crypto.randomUUID()
+
+    let bounceFile: ReportFile | null = null
+    let missingEmailFile: ReportFile | null = null
+
+    if (hasBounces) {
+      const bounceCsv = buildSemicolonCsv(
+        [
+          'process_id',
+          'customer_f_name',
+          'customer_l_name',
+          'customer_mail',
+          'melo',
+          'meter_number',
+          'created_at',
+          'execution_date',
+          'customer_label',
+          'trigger_id',
+        ],
+        activeBounces.map(p => [
+          p.id,
+          getPiiField(p.Customer_PII, 'customer_f_name'),
+          getPiiField(p.Customer_PII, 'customer_l_name'),
+          getPiiField(p.Customer_PII, 'customer_mail'),
+          getPiiField(p.Customer_PII, 'melo'),
+          getPiiField(p.Customer_PII, 'meter_number'),
+          p.created_at ? formatDateDE(p.created_at) : null,
+          p.execution_date ? formatDateDE(p.execution_date) : null,
+          p.customer_label ?? null,
+          p.trigger_id ?? null,
+        ]),
+      )
+
+      bounceFile = await uploadCsvReport(
+        supabase,
+        reportDateIso,
+        reportJobId,
+        `email_bounces_${reportDateIso}.csv`,
+        bounceCsv,
+      )
+    }
+
+    if (hasMissingEmailCases) {
+      const missingEmailCsv = buildSemicolonCsv(
+        [
+          'trigger_candidate_id',
+          'melo',
+          'trigger_type',
+          'added',
+          'org_exe_date',
+          'ex_date',
+          'trigger_status',
+          'extra_info',
+        ],
+        missingEmailCasesLast7Days.map(entry => [
+          entry.Trigger_Candidate_ID ?? null,
+          entry.Melo ?? null,
+          entry.Trigger_Type ?? null,
+          entry.Added ? formatDateDE(entry.Added) : null,
+          entry.Org_Exe_Date ? formatDateDE(entry.Org_Exe_Date) : null,
+          entry.Ex_Date ? formatDateDE(entry.Ex_Date) : null,
+          entry.Trigger_Status ?? null,
+          entry.extra_info ?? null,
+        ]),
+      )
+
+      missingEmailFile = await uploadCsvReport(
+        supabase,
+        reportDateIso,
+        reportJobId,
+        `missing_emails_${reportDateIso}.csv`,
+        missingEmailCsv,
+      )
+    }
+
     // ==========================================
     // 5. HELFER FÜR SAUBERE STATUS-ZEILEN (Vertikaler Flow)
     // ==========================================
@@ -466,12 +636,11 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
     // Bounces kompakt für das UI aufbereiten
     const bounceColumns: any[] = [];
     if (hasBounces) {
-      activeBounces.slice(0, 5).forEach(p => {
-        const pii = p.Customer_PII;
-        const customer_f_name = Array.isArray(pii) ? pii[0]?.customer_f_name : pii?.customer_f_name;
-        const customer_l_name = Array.isArray(pii) ? pii[0]?.customer_l_name : pii?.customer_l_name;
-        const customer_mail = Array.isArray(pii) ? pii[0]?.customer_mail : pii?.customer_mail;
-        const melo = Array.isArray(pii) ? pii[0]?.melo : pii?.melo  
+      activeBounces.slice(0, BOUNCE_PREVIEW_LIMIT).forEach(p => {
+        const customer_f_name = getPiiField(p.Customer_PII, 'customer_f_name')
+        const customer_l_name = getPiiField(p.Customer_PII, 'customer_l_name')
+        const customer_mail = getPiiField(p.Customer_PII, 'customer_mail')
+        const melo = getPiiField(p.Customer_PII, 'melo')
 
         bounceColumns.push({
           "type": "ColumnSet",
@@ -520,21 +689,28 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
         });
       });
 
-      if (bouncedCount > 5) {
+      if (bouncedCount > BOUNCE_PREVIEW_LIMIT) {
         bounceColumns.push({
           "type": "TextBlock",
-          "text": `*... und ${bouncedCount - 5} weitere Fehler (siehe Snowflake)*`,
+          "text": `*... und ${bouncedCount - BOUNCE_PREVIEW_LIMIT} weitere Fehler – vollständige Liste als CSV.*`,
           "isSubtle": true,
           "size": "Small",
-          "spacing": "Small"
+          "spacing": "Small",
+          "wrap": true
         });
+      }
+
+      if (bounceFile) {
+        bounceColumns.push(
+          downloadActionSet('Alle Zustellfehler als CSV laden', bounceFile.download_url),
+        )
       }
     }
     const missingEmailColumns: any[] = []
 
     if (hasMissingEmailCases) {
       missingEmailCasesLast7Days
-        .slice(0, 10)
+        .slice(0, MISSING_EMAIL_PREVIEW_LIMIT)
         .forEach(entry => {
           const triggerCandidateId =
             entry.Trigger_Candidate_ID ?? 'unbekannt'
@@ -590,15 +766,24 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
           })
         })
 
-      if (missingEmailCountLast7Days > 10) {
+      if (missingEmailCountLast7Days > MISSING_EMAIL_PREVIEW_LIMIT) {
         missingEmailColumns.push({
           "type": "TextBlock",
-          "text": `*... und ${missingEmailCountLast7Days - 10} weitere Fälle mit fehlender E-Mail-Adresse (siehe Trigger_Backlog).*`,
+          "text": `*... und ${missingEmailCountLast7Days - MISSING_EMAIL_PREVIEW_LIMIT} weitere Fälle – vollständige Liste als CSV.*`,
           "isSubtle": true,
           "size": "Small",
           "spacing": "Small",
           "wrap": true
         })
+      }
+
+      if (missingEmailFile) {
+        missingEmailColumns.push(
+          downloadActionSet(
+            'Alle fehlenden E-Mail-Adressen als CSV laden',
+            missingEmailFile.download_url,
+          ),
+        )
       }
     }
     const hasActionItems = hasBounces || hasMissingEmailCases
@@ -947,6 +1132,48 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
 
     console.log("[Success] 30-Tage Visual Dashboard an MS Teams gesendet und Snowflake synchronisiert.");
 
+    // Optional: dieselben CSVs an Power Automate (SharePoint), analog Weekly-Report.
+    // Eigener Webhook, damit der Weekly-Flow nicht getroffen wird.
+    const teamsReportPaUrl = Deno.env.get('TEAMS_REPORT_PA_WEBHOOK_URL')
+    const reportWebhookSecret = Deno.env.get('REPORT_WEBHOOK_SECRET')
+
+    if (teamsReportPaUrl && (bounceFile || missingEmailFile)) {
+      if (!reportWebhookSecret) {
+        collector.warn(
+          'TEAMS_REPORT_PA_WEBHOOK_URL ist gesetzt, aber REPORT_WEBHOOK_SECRET fehlt – SharePoint-Handoff übersprungen.',
+        )
+      } else {
+        const paPayload = {
+          secret: reportWebhookSecret,
+          report_kind: 'teams-action-lists',
+          job_id: reportJobId,
+          report_date: formatDateDE(todayUtc),
+          bounce_file: bounceFile,
+          bounce_count: bouncedCount,
+          missing_email_file: missingEmailFile,
+          missing_email_count: missingEmailCountLast7Days,
+        }
+
+        const paResponse = await fetch(teamsReportPaUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(paPayload),
+        })
+
+        const paResponseText = await paResponse.text()
+
+        if (!paResponse.ok) {
+          collector.error(
+            `Power Automate SharePoint-Handoff fehlgeschlagen (${paResponse.status}): ${paResponseText}`,
+          )
+        } else {
+          console.log(
+            `[Power Automate] Teams-Action-Listen an SharePoint-Flow übergeben. HTTP ${paResponse.status}`,
+          )
+        }
+      }
+    }
+
     await logPipelineRun(supabase, {
       jobName: JOB_NAME,
       status: 'success',
@@ -957,7 +1184,9 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
     return new Response(JSON.stringify({ 
       success: true, 
       message: "30-Tage-Report erfolgreich gesendet und Snowflake aktualisiert.", 
-      snowflake_sync: sfSyncSuccess 
+      snowflake_sync: sfSyncSuccess,
+      bounce_file: bounceFile,
+      missing_email_file: missingEmailFile,
     }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
       status: 200

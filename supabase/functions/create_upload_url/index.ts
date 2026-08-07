@@ -1,4 +1,6 @@
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
+// Version 2.45.4 statt der sonst genutzten 2.39.8: Erst ab storage-js 2.7.0
+// unterstuetzt createSignedUploadUrl die upsert-Option (siehe Schritt 8).
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
@@ -124,6 +126,8 @@ Deno.serve(async (req) => {
     // Das überschreibt automatisch ältere Versuche für denselben Zähler dieses Falls.
     const storagePath = `${process_id}/${obis_code}.${fileExtension}`
 
+    const runContext = { process_id, obis_code, storage_path: storagePath }
+
 
     // 8. Signierte Upload-URL von Supabase Storage anfordern
     // Wir nutzen einen privaten Bucket namens "meter-readings_pics"
@@ -134,8 +138,13 @@ Deno.serve(async (req) => {
       .createSignedUploadUrl(storagePath, { upsert: true })
 
     if (uploadError || !uploadData) {
-      collector.error(`Upload-Freigabe fehlgeschlagen: ${uploadError?.message}`, { process_id, obis_code })
-      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
+      collector.error(`Upload-Freigabe fehlgeschlagen: ${uploadError?.message}`, {
+        process_id,
+        obis_code,
+        storage_path: storagePath,
+        filename,
+      })
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime, context: runContext })
       return new Response(
         JSON.stringify({ error: 'Fehler beim Erstellen der Upload-Freigabe.', details: uploadError?.message }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -145,7 +154,7 @@ Deno.serve(async (req) => {
     // 9. Erfolgreiche Rückgabe
     // Wir geben dem Lovable-Frontend die "signedUrl" (wohin die Datei gesendet werden muss)
     // und den "storagePath" (den wir später in der DB speichern).
-    await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
+    await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime, context: runContext })
     return new Response(
       JSON.stringify({
         success: true,

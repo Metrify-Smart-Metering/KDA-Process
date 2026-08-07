@@ -14,6 +14,8 @@ declare
   v_pii_id       uuid;
   v_process_id   bigint;
   v_existing_id  bigint;
+  v_plz_raw      text;
+  v_plz          text;
 begin
   select btrim(b."Melo"), b."Ex_Date"
     into v_melo, v_ex_date
@@ -24,6 +26,12 @@ begin
   if not found then
     raise exception 'Backlog-Kandidat % nicht gefunden', p_candidate_id;
   end if;
+
+  v_plz_raw := nullif(btrim(p_pii ->> 'customer_plz'), '');
+  if v_plz_raw is null or v_plz_raw !~ '^\d{5}$' then
+    raise exception 'customer_plz muss genau 5 Ziffern haben, erhalten: %', coalesce(p_pii ->> 'customer_plz', '<null>');
+  end if;
+  v_plz := v_plz_raw;
 
   select p.id
     into v_existing_id
@@ -70,7 +78,7 @@ begin
     p_pii ->> 'customer_salutation',
     p_pii ->> 'melo',
     p_pii ->> 'meter_number',
-    nullif(p_pii ->> 'customer_plz', '')::integer
+    v_plz
   )
   returning id into v_pii_id;
 

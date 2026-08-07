@@ -92,12 +92,16 @@ begin
   -- Bestehende accepted-Nachbarn (in_run = false) sowie die im Lauf selbst
   -- getroffenen accepted-Entscheidungen (in_run = true)
 
+  -- Blockierend ist jeder Prozess ausser kda_status 404 (Mail nicht
+  -- zustellbar) - der Kunde wurde nie erreicht, der Prozess ist tot.
+  -- kda_status 50 (Ersatzwert/Schaetzung) blockiert bewusst mit: der Wert ist
+  -- gesetzt und im Lockout-Fenster darf kein zweiter Trigger nachlaufen.
   drop table if exists pg_temp._proc;
   create temp table _proc on commit drop as
   select p.melo, p.execution_date, p.id
   from public."Process_Database" p
   where p.melo = any(v_batch_melos)
-    and p.kda_status not in (50, 404);
+    and p.kda_status <> 404;
 
   create index on _proc (melo);
 
