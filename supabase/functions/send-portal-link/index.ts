@@ -3,6 +3,14 @@ import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 import { encryptToken } from "../_shared/tokenCrypto.ts"
 import { requireSecretApiKey } from "../_shared/utils/auth.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
+import {
+  CUSTOMER_LABEL_MAIL_SELECT,
+  brandTemplateData,
+  requireTemplateId,
+  resolveMailBranding,
+  sendDynamicTemplateMail,
+  type CustomerLabelMailRow,
+} from "../_shared/utils/sendgrid.ts"
 
 const JOB_NAME = 'send-portal-link'
 
@@ -19,20 +27,6 @@ const corsHeaders = {
 // CONFIGURATION Constants
 // ==========================================
 const DEFAULT_KDA_REASON = "als Ihr Messstellenbetreiber wollen wir Ihre Stromerzeugung und Ihren Verbrauch möglichst genau erfassen. Deswegen würden wir gerne aus Datenqualitätsgründen Ihren Zählerstand erfassen.";
-//===========================================
-// >>> BRAND TEMPLATE MAPPING <<<
-// Hier kannst du für verschiedene customer_labels eigene SendGrid Template-IDs
-// hinterlegen. Falls ein Label hier nicht aufgeführt ist, wird der Fallback verwendet.
-// ---------------------------------------------------------------------
-const BRAND_TEMPLATES: Record<string, string> = {
-  'metrify_standard': 'd-41180264fb4645f9af92796c6bd6c460',
-  'dmg_standard': 'd-df834a96a3dc4025bc756b8175567be4', // Beispiel für ein weiteres Label
-  // 'enpal_partner': 'd-yyyyyyyyyyyyyyyyyyyyyyyyyyyyy', // Beispiel für ein weiteres Label
-};
-
-// Fallback Template-ID (wird verwendet, wenn das customer_label nicht gemappt ist)
-const DEFAULT_TEMPLATE_ID = 'd-41180264fb4645f9af92796c6bd6c460';
-// =====================================================================
 
 // ==========================================
 // MAIN HANDLER
@@ -131,15 +125,7 @@ Deno.serve(async (req) => {
     console.log(`[Load] Lade Branding für Label: ${customerLabel}...`);
     const { data: labelData, error: labelError } = await supabase
       .from('customer_labels')
-      .select(`
-        out_email,
-        company_name,
-        company_address,
-        sender_name,
-        brand_primary_color,
-        brand_secondary_color,
-        support_email
-      `)
+      .select(CUSTOMER_LABEL_MAIL_SELECT)
       .eq('customer_label', customerLabel)
       .single();
 
@@ -149,15 +135,10 @@ Deno.serve(async (req) => {
       );
     }
 
-    const fromEmail = labelData.out_email;
-    const senderName = labelData.sender_name || labelData.company_name || 'Kundenservice';
-    const companyName = labelData.company_name || senderName;
-    const companyAddress = labelData.company_address || '';
-    const supportEmail = labelData.support_email || null;
-
-    if (!fromEmail) {
-      throw new Error(`Für customer_label "${customerLabel}" ist keine out_email gepflegt.`);
-    }
+    const branding = resolveMailBranding(labelData as CustomerLabelMailRow, customerLabel);
+    const templateId = requireTemplateId(labelData as CustomerLabelMailRow, 'first_mail', customerLabel);
+    const fromEmail = branding.fromEmail;
+    const senderName = branding.senderName;
 
     // 3. Trigger_Config laden (Begründungstext + Reminder-Intervalle für Token-Gültigkeit)
     let kdaReason = DEFAULT_KDA_REASON;
@@ -276,53 +257,27 @@ Deno.serve(async (req) => {
     // 9. Betreff festlegen
     const subject = `Bitte melden Sie uns Ihren aktuellen Zählerstand für den Zähler ${meterNumber}`;
 
-    // 10. Template-ID basierend auf customer_label bestimmen
-    const templateId = BRAND_TEMPLATES[customerLabel] || DEFAULT_TEMPLATE_ID;
     console.log(`[SendGrid] Gewählte Template-ID für customer_label '${customerLabel}': ${templateId}`);
 
-    // 11. SendGrid Mail über Dynamic Template API absenden
+    // 10. SendGrid Mail über Dynamic Template API absenden
     console.log(`[SendGrid] Sende Template-E-Mail an ${recipientEmail}...`);
-    const sendgridResponse = await fetch('https://api.sendgrid.com/v3/mail/send', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${sendgridApiKey}`,
-        'Content-Type': 'application/json',
+    await sendDynamicTemplateMail({
+      apiKey: sendgridApiKey,
+      to: recipientEmail,
+      fromEmail,
+      fromName: senderName,
+      templateId,
+      subject,
+      dynamicTemplateData: {
+        customerName: customerName,
+        kda_reason: kdaReason,
+        executionDateFormatted: executionDateFormatted,
+        meterNumber: meterNumber,
+        magicLink: magicLink,
+        linkValidityDays: linkValidityDays,
+        ...brandTemplateData(branding),
       },
-      body: JSON.stringify({
-        personalizations: [
-          {
-            to: [{ email: recipientEmail }],
-            custom_args: {
-              kda_source: 'kda-system'
-            },            
-            // Platzhalter-Werte, die an deine HTML-Vorlage übergeben werden
-            dynamic_template_data: {
-              customerName: customerName,
-              kda_reason: kdaReason,
-              executionDateFormatted: executionDateFormatted,
-              meterNumber: meterNumber,
-              magicLink: magicLink,
-              linkValidityDays: linkValidityDays,
-              companyName: companyName,
-              companyAddress: companyAddress,
-              supportEmail: supportEmail
-            }
-          }
-        ],
-        from: {
-          email: fromEmail,
-          name: senderName
-        },
-        subject: subject, // Metadaten-Betreff (Fallback)
-        template_id: templateId
-      })
     });
-
-    if (!sendgridResponse.ok) {
-      const errorBody = await sendgridResponse.text();
-      console.error("SendGrid API-Fehler:", errorBody);
-      throw new Error(`SendGrid API meldet Fehler-Code: ${sendgridResponse.status}`);
-    }
 
     // 12. Process_Database aktualisieren (mail_sent_at)
     const firstMailSentAt = new Date().toISOString();

@@ -1,8 +1,17 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
-import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 import { requireSecretApiKey } from "../_shared/utils/auth.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
+import {
+  berlinTodayIso,
+  fetchCustomerPii,
+  fetchTriggerViewRow,
+  getField,
+  meterNumberOf,
+  normalizeGermanPlz,
+  parseReadings,
+  toIsoDate,
+} from "../_shared/kda/enrichment.ts"
 
 const JOB_NAME = "insert_new_process"
 
@@ -17,8 +26,6 @@ const CLAIM_BATCH_SIZE = 50
 
 const USE_TEST_PII_FALLBACK = false
 
-const MELO_PATTERN = /^[A-Za-z0-9\-_.]{1,64}$/
-
 type ClaimedBacklogRow = {
   out_candidate_id: number
   out_melo: string
@@ -26,149 +33,6 @@ type ClaimedBacklogRow = {
   out_ex_date: string | null
   out_trigger_type: string | null
   out_process_exists: boolean
-}
-
-function getField(obj: any, keys: string[]): any {
-  if (!obj || typeof obj !== "object") return null
-  for (const k of keys) {
-    if (obj[k] !== undefined && obj[k] !== null) return obj[k]
-    const lowerK = k.toLowerCase()
-    if (obj[lowerK] !== undefined && obj[lowerK] !== null) return obj[lowerK]
-    const upperK = k.toUpperCase()
-    if (obj[upperK] !== undefined && obj[upperK] !== null) return obj[upperK]
-  }
-  return null
-}
-
-function assertValidMelo(melo: string): void {
-  if (!MELO_PATTERN.test(melo)) {
-    throw new Error(`Ungueltiges Melo-Format, Abbruch aus Sicherheitsgruenden: '${melo}'`)
-  }
-}
-
-/** Deutsche PLZ: genau 5 Ziffern, keine Auffüllung führender Nullen. */
-function normalizeGermanPlz(raw: unknown): string | null {
-  if (raw === undefined || raw === null) return null
-  const digits = String(raw).trim()
-  if (!/^\d{5}$/.test(digits)) return null
-  return digits
-}
-
-async function fetchCustomerPii(melo: string): Promise<any | null> {
-  assertValidMelo(melo)
-  const query = `
-    SELECT *
-    FROM TABLE(
-      OPERATIONS_SANDBOX.KDA.GET_CUSTOMER_PII(CAST(? AS VARCHAR))
-    )
-  `
-  const rows = await executeSnowflakeQuery("primary", query, {
-    "1": { type: "TEXT", value: melo },
-  })
-  return rows?.[0] ?? null
-}
-
-function toIsoDate(rawVal: any): string | null {
-  if (rawVal === undefined || rawVal === null) return null
-  if (rawVal instanceof Date) {
-    const year = rawVal.getUTCFullYear()
-    const month = String(rawVal.getUTCMonth() + 1).padStart(2, "0")
-    const day = String(rawVal.getUTCDate()).padStart(2, "0")
-    return `${year}-${month}-${day}`
-  }
-  const s = String(rawVal).trim()
-  if (!s) return null
-  const match = s.match(/^(\d{4})-(\d{2})-(\d{2})/)
-  if (match) return `${match[1]}-${match[2]}-${match[3]}`
-  if (/^\d+$/.test(s)) {
-    const n = parseInt(s, 10)
-    if (n < 100000) {
-      const d = new Date(n * 24 * 60 * 60 * 1000)
-      return d.toISOString().split("T")[0]
-    }
-  }
-  try {
-    const d = new Date(s)
-    if (!isNaN(d.getTime())) {
-      const year = d.getUTCFullYear()
-      const month = String(d.getUTCMonth() + 1).padStart(2, "0")
-      const day = String(d.getUTCDate()).padStart(2, "0")
-      if (year < 1900 || year > 3000) return null
-      return `${year}-${month}-${day}`
-    }
-  } catch {
-    return null
-  }
-  return null
-}
-
-function berlinTodayIso(): string {
-  const now = new Date()
-  const fmt = new Intl.DateTimeFormat("de-DE", {
-    timeZone: "Europe/Berlin",
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-  })
-  const parts = fmt.formatToParts(now)
-  const day = parts.find((p) => p.type === "day")?.value ?? "01"
-  const month = parts.find((p) => p.type === "month")?.value ?? "01"
-  const year = parts.find((p) => p.type === "year")?.value ?? "2026"
-  return `${year}-${month}-${day}`
-}
-
-type Reading = { date: string; value: number }
-
-// Process_Database erzwingt per Check-Constraint {date: string, value: number}.
-// Unvollstaendige Messwerte muessen daher als null durchgereicht werden.
-function normalizeReading(raw: unknown, todayIso: string): Reading | null {
-  if (!raw || typeof raw !== "object") return null
-  const obj = raw as Record<string, unknown>
-  const date = toIsoDate(obj.date) ?? todayIso
-  const value = Number(obj.value)
-  if (!Number.isFinite(value)) return null
-  return { date, value }
-}
-
-function parseReadings(customerRow: any, todayIso: string) {
-  let lastConsReading = null
-  const rawCons = getField(customerRow, ["last_cons_reading"])
-  if (rawCons) {
-    try {
-      lastConsReading = typeof rawCons === "string" ? JSON.parse(rawCons) : rawCons
-    } catch { /* ignore */ }
-  }
-  if (!lastConsReading) {
-    const consVal = getField(customerRow, [
-      "letzter_wert_1_8_0", "LETZTER_WERT_1_8_0", "wert_1_8_0", "value_1_8_0",
-    ])
-    const consDate = getField(customerRow, ["period_date_1_8_0", "PERIOD_DATE_1_8_0"])
-    if (consVal !== null && consVal !== undefined && consVal !== "") {
-      lastConsReading = { date: toIsoDate(consDate) || todayIso, value: Number(consVal) }
-    }
-  }
-
-  let lastProdReading = null
-  const rawProd = getField(customerRow, ["last_prod_reading"])
-  if (rawProd) {
-    try {
-      lastProdReading = typeof rawProd === "string" ? JSON.parse(rawProd) : rawProd
-    } catch { /* ignore */ }
-  }
-  if (!lastProdReading) {
-    const prodVal = getField(customerRow, [
-      "letzter_wert_2_8_0", "LETZTER_WERT_2_8_0", "wert_2_8_0", "value_2_8_0",
-    ])
-    const prodDate = getField(customerRow, ["period_date_2_8_0", "PERIOD_DATE_2_8_0"])
-    if (prodVal !== null && prodVal !== undefined && prodVal !== "") {
-      lastProdReading = { date: toIsoDate(prodDate) || todayIso, value: Number(prodVal) }
-    }
-  }
-
-  return {
-    lastConsReading: normalizeReading(lastConsReading, todayIso),
-    lastProdReading: normalizeReading(lastProdReading, todayIso),
-  }
 }
 
 Deno.serve(async (req) => {
@@ -299,20 +163,7 @@ Deno.serve(async (req) => {
 
       let customerRow: any = null
       try {
-        const query = `
-          SELECT *
-          FROM ${viewName}
-          WHERE TRIM(LOWER(melo)) = TRIM(LOWER(?))
-        `
-        const rows = await executeSnowflakeQuery("primary", query, {
-          "1": { type: "TEXT", value: melo },
-        })
-        if (rows.length > 0) {
-          customerRow = rows.find((r) => {
-            const rowDate = toIsoDate(getField(r, ["org_exe_date", "execution_date", "source_event_date"]))
-            return rowDate === orgExeDate
-          }) ?? rows[0]
-        }
+        customerRow = await fetchTriggerViewRow(viewName, melo, orgExeDate)
       } catch (err) {
         console.error(`[Snowflake-Fehler] View '${viewName}':`, (err as Error).message)
         collector.error(`Snowflake-View '${viewName}' fehlgeschlagen: ${(err as Error).message}`, {
@@ -324,7 +175,7 @@ Deno.serve(async (req) => {
         continue
       }
 
-      const meterNumberFromView = getField(customerRow, ["meter_number", "zaehlernummer", "meter", "meter_no"])
+      const meterNumberFromView = meterNumberOf(customerRow)
       const { lastConsReading, lastProdReading } = parseReadings(customerRow, todayIso)
 
       let piiRow: any = null

@@ -1,6 +1,14 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
+import {
+  CUSTOMER_LABEL_MAIL_SELECT,
+  brandTemplateData,
+  requireTemplateId,
+  resolveMailBranding,
+  sendDynamicTemplateMail,
+  type CustomerLabelMailRow,
+} from "../_shared/utils/sendgrid.ts"
 
 const JOB_NAME = 'submit_process'
 
@@ -12,19 +20,6 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
-
-// =====================================================================
-// >>> BRAND SUBMISSION CONFIRMATION TEMPLATE MAPPING <<<
-// Definiere hier pro customer_label die SendGrid Template-ID für die Bestätigungs-Mail.
-// ---------------------------------------------------------------------
-const BRAND_SUBMISSION_TEMPLATES: Record<string, string> = {
-  'metrify_standard': 'd-6bcac00bee144cd9a78cf075128bd86a', // Trage hier deine SendGrid Template-ID ein
-  'dmg_standard': 'd-c9b7698665c54e84a8d81a9f71d1de08', // Beispiel für ein weiteres Label
-};
-
-// Fallback, falls ein customer_label nicht im Mapping oben existiert
-const DEFAULT_SUBMISSION_TEMPLATE_ID = 'd-6bcac00bee144cd9a78cf075128bd86a';
-// =====================================================================
 
 // ==========================================
 // HELPERS
@@ -43,85 +38,6 @@ function formatNumberDE(value: number): string {
     minimumFractionDigits: 0,
     maximumFractionDigits: 3,
   }).format(value)
-}
-
-/**
- * Sendet die Bestätigungs-E-Mail über die SendGrid Dynamic Template API.
- */
-async function sendSubmissionConfirmationEmail(params: {
-  sendgridApiKey: string
-  recipientEmail: string
-  fromEmail: string
-  senderName: string
-  companyName: string
-  companyAddress: string
-  supportEmail?: string | null
-  customerName: string
-  meterNumber: string
-  consVal: number
-  prodVal: number | null
-  templateId: string
-}) {
-  const {
-    sendgridApiKey,
-    recipientEmail,
-    fromEmail,
-    senderName,
-    companyName,
-    companyAddress,
-    supportEmail,
-    customerName,
-    meterNumber,
-    consVal,
-    prodVal,
-    templateId,
-  } = params
-
-  const subject = `Vielen Dank für Ihre Zählerstandsmeldung für den Zähler ${meterNumber}`
-
-  // Daten für deine Handlebars-Platzhalter im SendGrid HTML-Template aufbereiten
-  const dynamicTemplateData = {
-    customerName: customerName,
-    meterNumber: meterNumber,
-    consumptionValue: formatNumberDE(consVal),
-    productionValue: prodVal !== null ? formatNumberDE(prodVal) : null, // {{#if productionValue}} greift nur, wenn befüllt
-    companyName: companyName,
-    companyAddress: companyAddress,
-    supportEmail: supportEmail || null,
-    logoUrl: true // Schaltet das Logo im Template frei
-  }
-
-  console.log(`[SendGrid] Sende Bestätigung an ${recipientEmail} mit Template ID '${templateId}'...`);
-
-  const sendgridResponse = await fetch('https://api.sendgrid.com/v3/mail/send', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${sendgridApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      personalizations: [
-        {
-          to: [{ email: recipientEmail }],
-          custom_args: {
-            kda_source: 'kda-system'
-          },
-          dynamic_template_data: dynamicTemplateData
-        }
-      ],
-      from: {
-        email: fromEmail,
-        name: senderName
-      },
-      subject: subject, // Metadaten-Betreff (Fallback)
-      template_id: templateId
-    })
-  })
-
-  if (!sendgridResponse.ok) {
-    const errorBody = await sendgridResponse.text()
-    throw new Error(`SendGrid API meldet Fehler-Code ${sendgridResponse.status}: ${errorBody}`)
-  }
 }
 
 // ==========================================
@@ -191,6 +107,15 @@ Deno.serve(async (req) => {
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
+    // customer_label früh laden, damit das Branding in JEDER Antwort verfügbar ist –
+    // auch in Fehlerfällen, die noch vor dem eigentlichen Prozess-Load auftreten.
+    const { data: labelRow } = await supabase
+      .from('Process_Database')
+      .select('customer_label')
+      .eq('id', process_id)
+      .maybeSingle()
+    const customerLabel = labelRow?.customer_label ?? null
+
     // 5. Token hashen und in "access_tokens" pruefen
     const hashedToken = await sha256(token)
 
@@ -203,15 +128,23 @@ Deno.serve(async (req) => {
 
     if (tokenError || !tokenData) {
       return new Response(
-        JSON.stringify({ error: 'Ungueltiger Token oder Zugriff verweigert.' }),
+        JSON.stringify({ error: 'Ungueltiger Token oder Zugriff verweigert.', code: 'LINK_UNKNOWN', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
-    // Token-Status pruefen (nicht abgelaufen, nicht benutzt)
-    if (tokenData.used_at !== null || new Date(tokenData.expires_at) < new Date()) {
+    // Token-Status pruefen: bereits benutzt?
+    if (tokenData.used_at !== null) {
       return new Response(
-        JSON.stringify({ error: 'Dieser Link ist nicht mehr gueltig.' }),
+        JSON.stringify({ error: 'Dieser Link ist nicht mehr gueltig.', code: 'LINK_USED', customer_label: customerLabel }),
+        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
+    // Token-Status pruefen: zeitlich abgelaufen?
+    if (new Date(tokenData.expires_at) < new Date()) {
+      return new Response(
+        JSON.stringify({ error: 'Dieser Link ist nicht mehr gueltig.', code: 'LINK_EXPIRED', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -235,7 +168,7 @@ Deno.serve(async (req) => {
 
     if (processError || !processData) {
       return new Response(
-        JSON.stringify({ error: 'Prozess wurde nicht gefunden.' }),
+        JSON.stringify({ error: 'Prozess wurde nicht gefunden.', code: 'LINK_UNKNOWN', customer_label: customerLabel }),
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -245,14 +178,14 @@ Deno.serve(async (req) => {
 
     if (!storedPlz || storedPlz !== inputPlz) {
       return new Response(
-        JSON.stringify({ error: 'Die eingegebene Postleitzahl ist ungueltig.' }),
+        JSON.stringify({ error: 'Die eingegebene Postleitzahl ist ungueltig.', code: 'INVALID_PLZ', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
     if (processData.kda_status >= 4 || processData.submitted_at !== null) {
       return new Response(
-        JSON.stringify({ error: 'Fuer diesen Fall wurden bereits Werte eingereicht.' }),
+        JSON.stringify({ error: 'Fuer diesen Fall wurden bereits Werte eingereicht.', code: 'LINK_USED', customer_label: customerLabel }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -276,15 +209,7 @@ Deno.serve(async (req) => {
     console.log(`[Load] Lade Branding für Label '${processData.customer_label}'...`);
     const { data: labelData, error: labelError } = await supabase
       .from('customer_labels')
-      .select(`
-        out_email,
-        company_name,
-        company_address,
-        sender_name,
-        brand_primary_color,
-        brand_secondary_color,
-        support_email
-      `)
+      .select(CUSTOMER_LABEL_MAIL_SELECT)
       .eq('customer_label', processData.customer_label)
       .single()
 
@@ -296,6 +221,10 @@ Deno.serve(async (req) => {
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
+
+    const mailRow = labelData as CustomerLabelMailRow
+    const branding = resolveMailBranding(mailRow, processData.customer_label)
+    const templateId = requireTemplateId(mailRow, 'submission_mail', processData.customer_label)
 
     // 7. Bilder/Dateien in "submission_files" eintragen (falls hochgeladen)
     const filesToInsert = []
@@ -365,28 +294,22 @@ Deno.serve(async (req) => {
       const customerName = lastName ? `${firstName} ${lastName}` : firstName
       const meterNumber = piiData.meter_number
 
-      if (
-        sendgridApiKey &&
-        recipientEmail &&
-        meterNumber &&
-        labelData.out_email
-      ) {
-        // Template-ID basierend auf customer_label bestimmen
-        const templateId = BRAND_SUBMISSION_TEMPLATES[processData.customer_label] || DEFAULT_SUBMISSION_TEMPLATE_ID;
-
-        await sendSubmissionConfirmationEmail({
-          sendgridApiKey,
-          recipientEmail,
-          fromEmail: labelData.out_email,
-          senderName: labelData.sender_name || labelData.company_name || 'Kundenservice',
-          companyName: labelData.company_name || labelData.sender_name || 'Kundenservice',
-          companyAddress: labelData.company_address || '',
-          supportEmail: labelData.support_email,
-          customerName,
-          meterNumber,
-          consVal: parsedConsVal,
-          prodVal: parsedProdVal,
-          templateId: templateId
+      if (sendgridApiKey && recipientEmail && meterNumber) {
+        console.log(`[SendGrid] Sende Bestätigung an ${recipientEmail} mit Template ID '${templateId}'...`)
+        await sendDynamicTemplateMail({
+          apiKey: sendgridApiKey,
+          to: recipientEmail,
+          fromEmail: branding.fromEmail,
+          fromName: branding.senderName,
+          templateId,
+          subject: `Vielen Dank für Ihre Zählerstandsmeldung für den Zähler ${meterNumber}`,
+          dynamicTemplateData: {
+            customerName,
+            meterNumber,
+            consumptionValue: formatNumberDE(parsedConsVal),
+            productionValue: parsedProdVal !== null ? formatNumberDE(parsedProdVal) : null,
+            ...brandTemplateData(branding),
+          },
         })
       } else {
         console.warn(`Bestaetigungs-E-Mail fuer Prozess ${process_id} wurde uebersprungen, da Daten oder SENDGRID_API_KEY fehlen.`)

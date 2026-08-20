@@ -49,6 +49,14 @@ Deno.serve(async (req) => {
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
+    // customer_label früh laden, damit das Branding in JEDER Antwort verfügbar ist –
+    // auch in Fehlerfällen, die noch vor dem eigentlichen Prozess-Load auftreten.
+    const { data: labelRow } = await supabase
+      .from('Process_Database')
+      .select('customer_label')
+      .eq('id', process_id)
+      .maybeSingle()
+    const customerLabel = labelRow?.customer_label ?? null
 
     // 4. Token hashen für den DB-Vergleich
     const hashedToken = await sha256(token)
@@ -65,7 +73,7 @@ Deno.serve(async (req) => {
     // Aus Sicherheitsgründen sagen wir nicht genau, ob die ID oder der Token falsch war.
     if (tokenError || !tokenData) {
       return new Response(
-        JSON.stringify({ error: 'Ungültiger Link oder Zugriff verweigert.' }),
+        JSON.stringify({ error: 'Ungültiger Link oder Zugriff verweigert.', code: 'LINK_UNKNOWN', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -75,7 +83,7 @@ Deno.serve(async (req) => {
     // Prüfung A: Wurde der Token bereits verwendet?
     if (tokenData.used_at !== null) {
       return new Response(
-        JSON.stringify({ error: 'Dieser Link wurde bereits verwendet und ist nicht mehr gültig.' }),
+        JSON.stringify({ error: 'Dieser Link wurde bereits verwendet und ist nicht mehr gültig.', code: 'LINK_USED', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -84,7 +92,7 @@ Deno.serve(async (req) => {
     const expirationDate = new Date(tokenData.expires_at)
     if (expirationDate < new Date()) {
       return new Response(
-        JSON.stringify({ error: 'Dieser Link ist abgelaufen.' }),
+        JSON.stringify({ error: 'Dieser Link ist abgelaufen.', code: 'LINK_EXPIRED', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -117,7 +125,7 @@ Deno.serve(async (req) => {
 
     if (processError || !processData) {
       return new Response(
-        JSON.stringify({ error: 'Zugehöriger Prozess wurde nicht gefunden.' }),
+        JSON.stringify({ error: 'Zugehöriger Prozess wurde nicht gefunden.', code: 'LINK_UNKNOWN', customer_label: customerLabel }),
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -132,6 +140,7 @@ Deno.serve(async (req) => {
       return new Response(
         JSON.stringify({ 
           error: 'Die eingegebene Postleitzahl ist ungueltig.',
+          code: 'INVALID_PLZ',
           customer_label: processData.customer_label ?? null,
         
         }),

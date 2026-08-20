@@ -1,4 +1,5 @@
-import { getSupabaseSecretKey } from "./env.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8";
+import { getSupabasePublishableKey, getSupabaseSecretKey, getSupabaseUrl } from "./env.ts";
 
 /**
  * Constant-time comparison. Both sides are hashed first so the loop always
@@ -61,4 +62,47 @@ export async function requireSecretApiKey(
   }
 
   return (await secretsEqual(provided, expected)) ? null : unauthorized;
+}
+
+/**
+ * Authorizes an end-user (logged-in reviewer) call via user JWT.
+ *
+ * Same contract as `submit_reviewed_values`: the user JWT must be sent on
+ * `Authorization: Bearer`, never an API key. The token is verified against
+ * Supabase Auth (not just checked for presence). On success returns the user;
+ * otherwise returns the `Response` to send back.
+ */
+export async function requireUser(
+  req: Request,
+  corsHeaders: Record<string, string> = {},
+): Promise<{ user: { id: string; email?: string }; error: null } | { user: null; error: Response }> {
+  const unauthorized = (message: string) =>
+    new Response(JSON.stringify({ success: false, error: message }), {
+      status: 401,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) {
+    return { user: null, error: unauthorized("Nicht eingeloggt.") };
+  }
+
+  const bearerToken = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (bearerToken.startsWith("sb_publishable_") || bearerToken.startsWith("sb_secret_")) {
+    return {
+      user: null,
+      error: unauthorized("Authorization muss ein Nutzer-Token enthalten, keinen API Key."),
+    };
+  }
+
+  const supabase = createClient(getSupabaseUrl(), getSupabasePublishableKey(), {
+    global: { headers: { Authorization: authHeader } },
+  });
+
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) {
+    return { user: null, error: unauthorized("Ungueltiges oder abgelaufenes Nutzer-Token.") };
+  }
+
+  return { user: { id: user.id, email: user.email ?? undefined }, error: null };
 }

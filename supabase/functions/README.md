@@ -252,6 +252,8 @@ Diese Trigger sollten nicht als KDA-Fachlogik verändert oder entfernt werden.
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `evaluate-plausibility`  | Reagiert auf eingereichte Werte, ruft die Snowflake-Plausibilitätsprüfung auf und entscheidet zwischen akzeptiert, manuellem Review, Schätzung oder Wiederholungsprozess. | `Process_Database`, `Customer_PII`, `submission_files`, Snowflake |
 | `submit_reviewed_values` | Ermöglicht authentifizierten internen Nutzern, einen Fall im Status `9` zu akzeptieren oder auf Schätzung zu setzen.                                                      | Supabase Auth, RLS, `Process_Database`                            |
+| `manual_process_preview` | Zeigt authentifizierten internen Nutzern die Snowflake-Daten (PII, Zählernummer, Zählerstände) zu einer manuell eingegebenen Melo, inkl. Zählernummer-Abgleich und Block-Gründen. Legt nichts an. | Supabase Auth, `Trigger_Config`, Snowflake |
+| `manual_process_create`  | Legt für eine manuell eingegebene Melo einen KDA-Prozess an (Trigger-Typ `manual_kda`), zieht die Daten frisch aus Snowflake und blockt bei fehlenden Pflichtdaten. Löst den Portal-Link-Versand aus. | Supabase Auth, Snowflake, `create_manual_process`, `Customer_PII`, `Process_Database` |
 
 
 ### Reporting und Betrieb

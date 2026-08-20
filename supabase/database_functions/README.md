@@ -53,6 +53,7 @@ supabase db query --local -f supabase/database_functions/select_kda_backlog.sql
 | `mark_backlog_already_exists.sql` | `insert_new_process` |
 | `mark_backlog_process_blocked.sql` | `insert_new_process` |
 | `finalize_process_creation.sql` | `insert_new_process` |
+| `create_manual_process.sql` | `manual_process_create` |
 | `count_pending_accepted_backlog.sql` | `insert_new_process` |
 | `set_process_melo.sql` | Trigger auf `Process_Database` |
 | `release_backlog_on_process_delete.sql` | Trigger auf `Process_Database` |

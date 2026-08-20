@@ -52,6 +52,15 @@ Deno.serve(async (req) => {
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
+    // customer_label früh laden, damit das Branding in JEDER Antwort verfügbar ist –
+    // auch in Fehlerfällen, die noch vor dem eigentlichen Prozess-Load auftreten.
+    const { data: labelRow } = await supabase
+      .from('Process_Database')
+      .select('customer_label')
+      .eq('id', process_id)
+      .maybeSingle()
+    const customerLabel = labelRow?.customer_label ?? null
+
     // 5. Token prüfen (Wie in open_process)
     const hashedToken = await sha256(token)
 
@@ -64,15 +73,23 @@ Deno.serve(async (req) => {
 
     if (tokenError || !tokenData) {
       return new Response(
-        JSON.stringify({ error: 'Ungültiger Token oder Zugriff verweigert.' }),
+        JSON.stringify({ error: 'Ungültiger Token oder Zugriff verweigert.', code: 'LINK_UNKNOWN', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
-    // Prüfung: Ist der Token schon abgelaufen oder verwendet?
-    if (tokenData.used_at !== null || new Date(tokenData.expires_at) < new Date()) {
+    // Prüfung: Wurde der Token bereits verwendet?
+    if (tokenData.used_at !== null) {
       return new Response(
-        JSON.stringify({ error: 'Dieser Link ist nicht mehr gültig.' }),
+        JSON.stringify({ error: 'Dieser Link ist nicht mehr gültig.', code: 'LINK_USED', customer_label: customerLabel }),
+        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
+    // Prüfung: Ist der Token zeitlich abgelaufen?
+    if (new Date(tokenData.expires_at) < new Date()) {
+      return new Response(
+        JSON.stringify({ error: 'Dieser Link ist nicht mehr gültig.', code: 'LINK_EXPIRED', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -93,7 +110,7 @@ Deno.serve(async (req) => {
 
     if (processError || !processData) {
       return new Response(
-        JSON.stringify({ error: 'Prozess nicht gefunden.' }),
+        JSON.stringify({ error: 'Prozess nicht gefunden.', code: 'LINK_UNKNOWN', customer_label: customerLabel }),
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -103,14 +120,14 @@ Deno.serve(async (req) => {
 
     if (!storedPlz || storedPlz !== inputPlz) {
       return new Response(
-        JSON.stringify({ error: 'Die eingegebene Postleitzahl ist ungueltig.' }),
+        JSON.stringify({ error: 'Die eingegebene Postleitzahl ist ungueltig.', code: 'INVALID_PLZ', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
     if (processData.submitted_at !== null) {
       return new Response(
-        JSON.stringify({ error: 'Für diesen Prozess wurden bereits Daten eingereicht. Keine weiteren Uploads möglich.' }),
+        JSON.stringify({ error: 'Für diesen Prozess wurden bereits Daten eingereicht. Keine weiteren Uploads möglich.', code: 'LINK_USED', customer_label: customerLabel }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }

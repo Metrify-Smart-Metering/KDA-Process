@@ -3,6 +3,15 @@ import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 import { decryptToken } from "../_shared/tokenCrypto.ts"
 import { requireSecretApiKey } from "../_shared/utils/auth.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
+import {
+  CUSTOMER_LABEL_MAIL_SELECT,
+  brandTemplateData,
+  requireTemplateId,
+  resolveMailBranding,
+  sendDynamicTemplateMail,
+  type CustomerLabelMailRow,
+  type CustomerMailType,
+} from "../_shared/utils/sendgrid.ts"
 
 const JOB_NAME = 'send-kda-reminders'
 // ==========================================
@@ -14,32 +23,7 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
-type MailType = 'second_mail' | 'escalation_mail' | 'estimated_value_mail'
-
-// =====================================================================
-// >>> BRAND REMINDERS TEMPLATE MAPPING <<<
-// Definiere hier pro customer_label und E-Mail-Typ die SendGrid Template-IDs.
-// ---------------------------------------------------------------------
-const TEMPLATES_BY_BRAND: Record<string, Record<MailType, string>> = {
-  'metrify_standard': {
-    'second_mail': 'd-155279e9a699433b9b6f4afc4cdbdf8e',      // Trage hier die SendGrid Template-ID für die 1. Erinnerung ein
-    'escalation_mail': 'd-b93dc7267dd242be95d6ec37afe95ded',  // Trage hier die SendGrid Template-ID für die letzte Erinnerung ein
-    'estimated_value_mail': 'd-3d6d940e016044b793e1a3d26f41c5c7' // Trage hier die SendGrid Template-ID für die Schätzungs-Bestätigung ein
-  },
-   'dmg_standard': {
-    'second_mail': 'd-0fbfdd6fc239404787a6a47e9716dec3',      // Trage hier die SendGrid Template-ID für die 1. Erinnerung ein
-    'escalation_mail': 'd-040aa27154bc49f3ae22843a13bf91f0',  // Trage hier die SendGrid Template-ID für die letzte Erinnerung ein
-    'estimated_value_mail': 'd-6cea80eff7114c3eb54be17e931691e4' // Trage hier die SendGrid Template-ID für die Schätzungs-Bestätigung ein
-  }
-};
-
-// Fallbacks, falls ein customer_label nicht im Mapping oben existiert
-const DEFAULT_TEMPLATES: Record<MailType, string> = {
-    'second_mail': 'd-155279e9a699433b9b6f4afc4cdbdf8e ',      // Trage hier die SendGrid Template-ID für die 1. Erinnerung ein
-    'escalation_mail': 'd-b93dc7267dd242be95d6ec37afe95ded',  // Trage hier die SendGrid Template-ID für die letzte Erinnerung ein
-    'estimated_value_mail': 'd-3d6d940e016044b793e1a3d26f41c5c7 ' // Trage hier die SendGrid Template-ID für die Schätzungs-Bestätigung ein
-  };
-// =====================================================================
+type MailType = Extract<CustomerMailType, 'second_mail' | 'escalation_mail' | 'estimated_value_mail'>
 
 // ==========================================
 // HELPERS
@@ -286,13 +270,7 @@ Deno.serve(async (req) => {
         // 5. Branding-/Absenderdaten laden
         const { data: labelData, error: labelError } = await supabase
           .from('customer_labels')
-          .select(`
-            out_email,
-            company_name,
-            company_address,
-            sender_name,
-            support_email
-          `)
+          .select(CUSTOMER_LABEL_MAIL_SELECT)
           .eq('customer_label', customerLabel)
           .single()
 
@@ -314,15 +292,9 @@ Deno.serve(async (req) => {
           throw new Error('Keine meter_number vorhanden.')
         }
 
-        const fromEmail = labelData.out_email
-        const senderName = labelData.sender_name || labelData.company_name || 'Kundenservice'
-        const companyName = labelData.company_name || senderName
-        const companyAddress = labelData.company_address || ''
-        const supportEmail = labelData.support_email || null
-
-        if (!fromEmail) {
-          throw new Error(`Keine out_email für customer_label "${customerLabel}" vorhanden.`)
-        }
+        const branding = resolveMailBranding(labelData as CustomerLabelMailRow, customerLabel)
+        const fromEmail = branding.fromEmail
+        const senderName = branding.senderName
 
         // 6. Bestehenden Token wiederverwenden (second_mail / escalation_mail)
         // bzw. Token entwerten (estimated_value_mail). Es wird NIE ein neuer
@@ -345,9 +317,7 @@ Deno.serve(async (req) => {
 
         const executionDateFormatted = executionDate ? formatDateDE(executionDate) : '-'
 
-        // 7. Template-ID basierend auf customer_label & mailType ermitteln
-        const brandMap = TEMPLATES_BY_BRAND[customerLabel] || DEFAULT_TEMPLATES
-        const templateId = brandMap[mailType]
+        const templateId = requireTemplateId(labelData as CustomerLabelMailRow, mailType, customerLabel)
         console.log(`[SendGrid] Gewählte Template-ID für Label '${customerLabel}' & Typ '${mailType}': ${templateId}`)
 
         // 8. Betreff (Fallback)
@@ -358,44 +328,22 @@ Deno.serve(async (req) => {
             : `Information zur Schätzung Ihres Zählerstands für den Zähler ${meterNumber}`
 
         // 9. SendGrid E-Mail via Template API absenden
-        const sendgridResponse = await fetch('https://api.sendgrid.com/v3/mail/send', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${sendgridApiKey}`,
-            'Content-Type': 'application/json',
+        await sendDynamicTemplateMail({
+          apiKey: sendgridApiKey,
+          to: recipientEmail,
+          fromEmail,
+          fromName: senderName,
+          templateId,
+          subject,
+          dynamicTemplateData: {
+            customerName: customerName,
+            executionDateFormatted: executionDateFormatted,
+            meterNumber: meterNumber,
+            magicLink: magicLink,
+            linkValidityDays: linkValidityDays,
+            ...brandTemplateData(branding),
           },
-          body: JSON.stringify({
-            personalizations: [
-              {
-                to: [{ email: recipientEmail }],
-                custom_args: {
-                  kda_source: 'kda-system'
-                },
-                dynamic_template_data: {
-                  customerName: customerName,
-                  executionDateFormatted: executionDateFormatted,
-                  meterNumber: meterNumber,
-                  magicLink: magicLink,
-                  linkValidityDays: linkValidityDays,
-                  companyName: companyName,
-                  companyAddress: companyAddress,
-                  supportEmail: supportEmail,
-                }
-              }
-            ],
-            from: {
-              email: fromEmail,
-              name: senderName
-            },
-            subject: subject,
-            template_id: templateId
-          })
         })
-
-        if (!sendgridResponse.ok) {
-          const errorBody = await sendgridResponse.text()
-          throw new Error(`SendGrid API meldet Fehler-Code ${sendgridResponse.status}: ${errorBody}`)
-        }
 
         // 9.b Bei der Schätzwert-Mail: Token endgültig entwerten.
         // Wird NACH erfolgreichem Mailversand ausgeführt, damit bei einem

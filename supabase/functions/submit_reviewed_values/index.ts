@@ -4,10 +4,18 @@ import { getSupabasePublishableKey, getSupabaseSecretKey, getSupabaseUrl } from 
 
 const JOB_NAME = 'submit_reviewed_values'
 
+// Gleicher Trigger wie in evaluate-plausibility (historischer Tippfehler in der ID).
+const REPETITION_TRIGGER_ID = 'implausible_value_repetion'
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
+}
+
+function repetitionExecutionDateIso(now = new Date()): string {
+  const execDate = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
+  return execDate.toISOString().split('T')[0]
 }
 
 Deno.serve(async (req) => {
@@ -38,6 +46,9 @@ Deno.serve(async (req) => {
     const supabase = createClient(getSupabaseUrl(), getSupabasePublishableKey(), {
       global: { headers: { Authorization: authHeader } }
     })
+    // Inserts (Wiederholungsprozess) und pipeline_control umgehen RLS.
+    // Authenticated hat auf Process_Database UPDATE, aber kein INSERT.
+    const supabaseAdmin = createClient(getSupabaseUrl(), getSupabaseSecretKey())
     const startTime = Date.now()
     const collector = new RunErrorCollector()
 
@@ -62,8 +73,8 @@ Deno.serve(async (req) => {
       })
     }
 
-    if (action !== 'accept' && action !== 'estimate') {
-      return new Response(JSON.stringify({ error: 'Ungueltige action. Erlaubt: "accept" oder "estimate".' }), {
+    if (action !== 'accept' && action !== 'estimate' && action !== 'new_reading') {
+      return new Response(JSON.stringify({ error: 'Ungueltige action. Erlaubt: "accept", "estimate" oder "new_reading".' }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
@@ -93,7 +104,9 @@ Deno.serve(async (req) => {
         submitted_at: new Date().toISOString()
       }
     } else {
-      // action === 'estimate' -> bewusst KEINE cons_val/prod_val setzen
+      // estimate und new_reading: Originalfall verlaesst die Review-Queue
+      // (Status 50). Bei new_reading werden bewusst keine Zahlenwerte
+      // erwartet; der Folgeprozess entsteht nach dem Update.
       updatePayload = {
         kda_status: 50
       }
@@ -113,7 +126,7 @@ Deno.serve(async (req) => {
       console.error(`[DB-Fehler] Update fuer process_id ${process_id} fehlgeschlagen:`, updateError.message)
       collector.error(`Update fuer process_id ${process_id} fehlgeschlagen: ${updateError.message}`, { process_id, action })
 
-      await logPipelineRun(supabase, {
+      await logPipelineRun(supabaseAdmin, {
         jobName: JOB_NAME,
         status: 'error',
         collector,
@@ -160,7 +173,7 @@ Deno.serve(async (req) => {
       console.warn(`[Update-Konflikt] ${reason}`)
       collector.warn(reason, { process_id, action })
 
-      await logPipelineRun(supabase, {
+      await logPipelineRun(supabaseAdmin, {
         jobName: JOB_NAME,
         status: 'success', // Kein technischer Fehler der Pipeline, nur ein Konfliktfall
         collector,
@@ -172,14 +185,90 @@ Deno.serve(async (req) => {
       })
     }
 
-    await logPipelineRun(supabase, {
+    let newProcessId: number | null = null
+    let newExecutionDate: string | null = null
+
+    if (action === 'new_reading') {
+      const source = data[0]
+      const revertOriginal = async () => {
+        const { error: revertError } = await supabase
+          .from('Process_Database')
+          .update({ kda_status: 9 })
+          .eq('id', process_id)
+          .eq('kda_status', 50)
+
+        if (revertError) {
+          console.error(`[DB-Fehler] Konnte process_id ${process_id} nach fehlgeschlagenem Wiederholungs-Insert nicht auf Status 9 zuruecksetzen:`, revertError.message)
+          collector.error(`Revert auf Status 9 fehlgeschlagen: ${revertError.message}`, { process_id, action })
+        }
+      }
+
+      if (!source.customer_pii_id || !source.customer_label) {
+        await revertOriginal()
+        collector.error(`Wiederholungsprozess nicht anlegbar: customer_pii_id oder customer_label fehlt.`, { process_id, action })
+        await logPipelineRun(supabaseAdmin, {
+          jobName: JOB_NAME,
+          status: 'error',
+          collector,
+          fatalErrorMessage: `Stammdaten unvollstaendig fuer process_id ${process_id}`
+        })
+        return new Response(JSON.stringify({ error: 'Fall hat unvollstaendige Stammdaten. Wiederholungsprozess konnte nicht angelegt werden.' }), {
+          status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        })
+      }
+
+      const execDateIso = repetitionExecutionDateIso()
+      const { data: newProc, error: insertErr } = await supabaseAdmin
+        .from('Process_Database')
+        .insert({
+          customer_pii_id: source.customer_pii_id,
+          customer_label: source.customer_label,
+          trigger_id: REPETITION_TRIGGER_ID,
+          execution_date: execDateIso,
+          kda_status: 0, // klassischer Weg, analog evaluate-plausibility
+          last_cons_reading: source.last_cons_reading,
+          last_prod_reading: source.last_prod_reading,
+        })
+        .select('id')
+        .single()
+
+      if (insertErr || !newProc) {
+        await revertOriginal()
+        const insertMessage = insertErr?.message ?? 'Kein Datensatz zurueckgegeben'
+        console.error(`[DB-Fehler] Wiederholungs-Insert fuer process_id ${process_id} fehlgeschlagen:`, insertMessage)
+        collector.error(`Wiederholungs-Insert fehlgeschlagen: ${insertMessage}`, { process_id, action })
+        await logPipelineRun(supabaseAdmin, {
+          jobName: JOB_NAME,
+          status: 'error',
+          collector,
+          fatalErrorMessage: insertMessage
+        })
+        return new Response(JSON.stringify({ error: 'Interner Serverfehler beim Anlegen des Wiederholungsprozesses.' }), {
+          status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        })
+      }
+
+      newProcessId = newProc.id
+      newExecutionDate = execDateIso
+    }
+
+    await logPipelineRun(supabaseAdmin, {
       jobName: JOB_NAME,
       status: 'success',
       collector,
       durationMs: Date.now() - startTime
     })
 
-    return new Response(JSON.stringify({ success: true, new_status: updatePayload.kda_status }), {
+    const responseBody: Record<string, unknown> = {
+      success: true,
+      new_status: updatePayload.kda_status,
+    }
+    if (newProcessId !== null) {
+      responseBody.new_process_id = newProcessId
+      responseBody.new_execution_date = newExecutionDate
+    }
+
+    return new Response(JSON.stringify(responseBody), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     })
 
