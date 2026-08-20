@@ -73,8 +73,8 @@ Deno.serve(async (req) => {
       })
     }
 
-    if (action !== 'accept' && action !== 'estimate' && action !== 'new_reading') {
-      return new Response(JSON.stringify({ error: 'Ungueltige action. Erlaubt: "accept", "estimate" oder "new_reading".' }), {
+    if (action !== 'accept' && action !== 'estimate' && action !== 'new_reading' && action !== 'dismiss') {
+      return new Response(JSON.stringify({ error: 'Ungueltige action. Erlaubt: "accept", "estimate", "new_reading" oder "dismiss".' }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
@@ -103,6 +103,12 @@ Deno.serve(async (req) => {
         kda_status: 100,
         submitted_at: new Date().toISOString()
       }
+    } else if (action === 'dismiss') {
+      // Manuell geschlossen: verlaesst die Review-Queue ohne Schaetzung,
+      // ohne Massenupload und ohne Folgeprozess (kda_status 999).
+      updatePayload = {
+        kda_status: 999
+      }
     } else {
       // estimate und new_reading: Originalfall verlaesst die Review-Queue
       // (Status 50). Bei new_reading werden bewusst keine Zahlenwerte
@@ -112,7 +118,12 @@ Deno.serve(async (req) => {
       }
     }
 
-    const { error: updateError, data } = await supabase
+    // dismiss setzt kda_status 999. Live-RLS/WITH CHECK kennt den Wert
+    // oft noch nicht (Allowlist ohne 999, oder Lookup-Zeile fehlt).
+    // Wie beim Wiederholungs-Insert deshalb service_role; der Reviewer
+    // ist oben bereits per JWT geprueft.
+    const updateClient = action === 'dismiss' ? supabaseAdmin : supabase
+    const { error: updateError, data } = await updateClient
       .from('Process_Database')
       .update(updatePayload)
       .eq('id', process_id)

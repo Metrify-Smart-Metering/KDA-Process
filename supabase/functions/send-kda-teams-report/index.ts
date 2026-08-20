@@ -39,6 +39,7 @@ const STATUS_META: Record<number, { label: string; dot: string }> = {
   50: { label: "Estimated Value", dot: "📊" },
   100: { label: "Value Accepted", dot: "✅" },
   404: { label: "Email is not able to be sent", dot: "❌" },
+  999: { label: "Manually dismissed", dot: "🚫" },
   1000: { label: "Mass Upload File", dot: "📁" }
 };
 

@@ -94,8 +94,9 @@ begin
 
   -- Blockierend ist jeder Prozess ausser kda_status 404 (Mail nicht
   -- zustellbar) - der Kunde wurde nie erreicht, der Prozess ist tot.
-  -- kda_status 50 (Ersatzwert/Schaetzung) blockiert bewusst mit: der Wert ist
-  -- gesetzt und im Lockout-Fenster darf kein zweiter Trigger nachlaufen.
+  -- kda_status 50 (Ersatzwert/Schaetzung) und 999 (manuell dismissed)
+  -- blockieren bewusst mit: der Fall ist abgeschlossen und im
+  -- Lockout-Fenster darf kein zweiter Trigger nachlaufen.
   drop table if exists pg_temp._proc;
   create temp table _proc on commit drop as
   select p.melo, p.execution_date, p.id
