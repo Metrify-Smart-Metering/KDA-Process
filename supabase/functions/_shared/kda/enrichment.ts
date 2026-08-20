@@ -72,6 +72,13 @@ export function toIsoDate(rawVal: any): string | null {
   return null
 }
 
+/** Addiert `days` Kalendertage zu einem ISO-Datum (YYYY-MM-DD, UTC-basiert). */
+export function addDaysIso(iso: string, days: number): string {
+  const d = new Date(`${iso}T00:00:00Z`)
+  d.setUTCDate(d.getUTCDate() + (Number.isFinite(days) ? days : 0))
+  return d.toISOString().split("T")[0]
+}
+
 export function berlinTodayIso(): string {
   const now = new Date()
   const fmt = new Intl.DateTimeFormat("de-DE", {

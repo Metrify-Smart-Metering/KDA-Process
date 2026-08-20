@@ -11,6 +11,7 @@ as $$
 declare
   v_melo         text;
   v_ex_date      date;
+  v_exec_date    date;
   v_pii_id       uuid;
   v_process_id   bigint;
   v_existing_id  bigint;
@@ -27,6 +28,12 @@ begin
     raise exception 'Backlog-Kandidat % nicht gefunden', p_candidate_id;
   end if;
 
+  -- Effektives Ausfuehrungsdatum: der Aufrufer (insert_new_process) hebt ein
+  -- veraltetes Ex_Date auf heute + min_lead_time an, damit nie ein Prozess mit
+  -- Datum in der Vergangenheit entsteht. Dedup, Insert und der Ex_Date-Abgleich
+  -- im Backlog nutzen denselben Wert, damit execution_date == Ex_Date bleibt.
+  v_exec_date := coalesce((p_process ->> 'execution_date')::date, v_ex_date);
+
   v_plz_raw := nullif(btrim(p_pii ->> 'customer_plz'), '');
   if v_plz_raw is null or v_plz_raw !~ '^\d{5}$' then
     raise exception 'customer_plz muss genau 5 Ziffern haben, erhalten: %', coalesce(p_pii ->> 'customer_plz', '<null>');
@@ -36,7 +43,7 @@ begin
   select p.id
     into v_existing_id
   from public."Process_Database" p
-  where p.execution_date = v_ex_date
+  where p.execution_date = v_exec_date
     and (
       btrim(p.melo) = v_melo
       or exists (
@@ -53,6 +60,7 @@ begin
     set extra_info   = 'process already exists',
         processed_at = now(),
         claimed_at   = null,
+        "Ex_Date"    = v_exec_date,
         process_id   = v_existing_id
     where "Trigger_Candidate_ID" = p_candidate_id;
 
@@ -92,7 +100,7 @@ begin
     last_prod_reading
   )
   values (
-    coalesce((p_process ->> 'execution_date')::date, v_ex_date),
+    v_exec_date,
     coalesce((p_process ->> 'kda_status')::smallint, 1::smallint),
     coalesce(p_process ->> 'customer_label', 'metrify_standard'),
     v_pii_id,
@@ -106,6 +114,7 @@ begin
   set process_id   = v_process_id,
       processed_at = now(),
       claimed_at   = null,
+      "Ex_Date"    = v_exec_date,
       extra_info   = 'process_created: ' || v_process_id::text
   where "Trigger_Candidate_ID" = p_candidate_id;
 

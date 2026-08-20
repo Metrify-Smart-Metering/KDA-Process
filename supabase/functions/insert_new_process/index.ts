@@ -3,6 +3,7 @@ import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
 import { requireSecretApiKey } from "../_shared/utils/auth.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 import {
+  addDaysIso,
   berlinTodayIso,
   fetchCustomerPii,
   fetchTriggerViewRow,
@@ -124,24 +125,15 @@ Deno.serve(async (req) => {
       const recId = rec.out_candidate_id
       const melo = String(rec.out_melo ?? "").trim()
       const orgExeDate = toIsoDate(rec.out_org_exe_date)
-      const exDate = toIsoDate(rec.out_ex_date)
+      const frozenExDate = toIsoDate(rec.out_ex_date)
       const triggerType = rec.out_trigger_type
 
       console.log(`--- Kandidat ${recId} (Melo: ${melo}, Type: ${triggerType}) ---`)
 
-      if (!melo || !exDate) {
+      if (!melo || !frozenExDate) {
         console.warn(`[Skip] Ungueltiger Datensatz: Melo oder Ex_Date fehlt.`)
         await supabase.rpc("release_backlog_claim", { p_candidate_id: recId })
         countFailed++
-        continue
-      }
-
-      const procKey = `${melo.toLowerCase()}_${exDate}`
-
-      if (rec.out_process_exists || createdInRun.has(procKey)) {
-        console.log(`[Already-Processed] Prozess fuer Melo ${melo} am ${exDate} existiert bereits.`)
-        await supabase.rpc("mark_backlog_already_exists", { p_candidate_id: recId })
-        countAlreadyExists++
         continue
       }
 
@@ -150,6 +142,30 @@ Deno.serve(async (req) => {
         console.warn(`[Skip] Keine Trigger-Config fuer Typ '${triggerType}'.`)
         await supabase.rpc("release_backlog_claim", { p_candidate_id: recId })
         countFailed++
+        continue
+      }
+
+      // Ex_Date wurde bei der 'accepted'-Entscheidung eingefroren. Liegt sie beim
+      // tatsaechlichen Anlegen in der Vergangenheit (Backlog-Verzug), wuerde die
+      // Downstream-Logik (send-kda-reminders/Ersatzwert) sofort ausloesen. Daher
+      // wie in select_kda_backlog auf max(Ex_Date, heute + min_lead_time) anheben.
+      const minLead = Number(cfg.min_lead_time ?? 0)
+      const earliestExDate = addDaysIso(todayIso, Number.isFinite(minLead) ? minLead : 0)
+      const exDate = frozenExDate < earliestExDate ? earliestExDate : frozenExDate
+      const exDateShifted = exDate !== frozenExDate
+      if (exDateShifted) {
+        console.log(`[Ex_Date] Veraltetes Ex_Date ${frozenExDate} auf ${exDate} angehoben (min_lead=${minLead}).`)
+      }
+
+      const procKey = `${melo.toLowerCase()}_${exDate}`
+
+      // Der aus dem Claim stammende Duplikat-Hinweis bezieht sich auf das alte
+      // (eingefrorene) Ex_Date. Wenn wir das Datum verschoben haben, ist er nicht
+      // mehr aussagekraeftig – finalize_process_creation prueft ohnehin autoritativ.
+      if ((!exDateShifted && rec.out_process_exists) || createdInRun.has(procKey)) {
+        console.log(`[Already-Processed] Prozess fuer Melo ${melo} am ${exDate} existiert bereits.`)
+        await supabase.rpc("mark_backlog_already_exists", { p_candidate_id: recId })
+        countAlreadyExists++
         continue
       }
 
