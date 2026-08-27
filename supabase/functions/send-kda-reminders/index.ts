@@ -54,6 +54,10 @@ function parseUtcDate(dateStr: string): Date {
  * Der Token wurde bereits in send-portal-link angelegt, mit einer
  * Gültigkeit bis execution_date + second_reminder_interval_days +
  * days_until_substitute_value + 1 Tag.
+ *
+ * Nur Zeilen mit encrypted_token: CS-Override-Tokens speichern den Klartext
+ * absichtlich nicht, sonst wuerde dieser Lookup den Agenten-Link an den Kunden
+ * mailen oder mit "kein Token" abbrechen.
  */
 async function getExistingRawToken(
   supabase: any,
@@ -64,6 +68,10 @@ async function getExistingRawToken(
     .select('encrypted_token, expires_at, used_at')
     .eq('process_id', processId)
     .is('used_at', null)
+    // CS-Override-Tokens haben bewusst kein encrypted_token. Ohne diesen Filter
+    // waere der neueste ungenutzte Token oft der CS-Token und der Reminder
+    // wuerde "kein Token" werfen statt den Kunden-Link zu nehmen.
+    .not('encrypted_token', 'is', null)
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle()
@@ -166,11 +174,43 @@ Deno.serve(async (req) => {
     }
     console.log(`[Load] ${processes?.length ?? 0} offene Prozesse zur Prüfung geladen.`);
 
+    // Aktive CS-Uebernahme: Kunden-Token ist pausiert, Agent fuellt das Formular.
+    // Reminder/Schaetzung wuerden den CS-Token killen oder den Kunden-Link
+    // in der Mail vermischen. Skip nur solange der Override NOCH GUELTIG ist
+    // (expires_at > now). Nach Ablauf holt der naechste 14-Uhr-Lauf nach (>=).
+    const activeOverrideIds = new Set<number>()
+    const openIds = (processes ?? []).map((p) => p.id as number).filter((id) => Number.isFinite(id))
+    if (openIds.length > 0) {
+      const { data: overrideRows, error: overrideErr } = await supabase
+        .from('access_tokens')
+        .select('process_id')
+        .in('process_id', openIds)
+        .eq('token_type', 'cs_override')
+        .is('used_at', null)
+        .gt('expires_at', new Date().toISOString())
+
+      if (overrideErr) {
+        collector.warn(`CS-Override-Lookup fehlgeschlagen, Reminder laufen ohne Skip: ${overrideErr.message}`)
+      } else {
+        for (const row of overrideRows ?? []) {
+          if (row.process_id != null) activeOverrideIds.add(Number(row.process_id))
+        }
+      }
+    }
+
     const results: Array<Record<string, unknown>> = []
 
     for (const process of processes ?? []) {
       try {
         const processId = process.id as number
+        if (activeOverrideIds.has(processId)) {
+          results.push({
+            process_id: processId,
+            action: 'skipped_cs_override',
+            current_status: process.kda_status,
+          })
+          continue
+        }
         const customerLabel = process.customer_label as string | null
         const piiId = process.customer_pii_id as string | null
         const executionDate = process.execution_date as string | null

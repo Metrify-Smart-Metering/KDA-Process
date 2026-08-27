@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { fetchAllRows } from "../_shared/supabase/fetchAll.ts"
 import { requireSecretApiKey } from "../_shared/utils/auth.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
@@ -30,11 +31,11 @@ function formatDateDE(value: string | Date | null): string {
   return `${day}.${month}.${year}`
 }
 
-// Zahl im internationalen Format (Punkt als Dezimaltrennzeichen);
+// Deutsches Zahlenformat (Komma als Dezimaltrennzeichen);
 // Spaltentrennzeichen der CSV ist Semikolon
 function formatNumber(value: number | null): string {
   if (value === null || value === undefined || isNaN(value)) return ''
-  return String(value)
+  return String(value).replace('.', ',')
 }
 
 // Baut die zwei CSV-Zeilen (1.8.0 und 2.8.0) fuer einen akzeptierten Fall
@@ -78,14 +79,28 @@ function buildCsvRows(row: {
     'COT'                              // Grund
   ]
 
-  return [
-    base(row.cons_val, '1-0:1.8.0').join(';'),
-    base(row.prod_val, '1-0:2.8.0').join(';')
-  ]
+  const rows = [base(row.cons_val, '1-0:1.8.0').join(';')]
+
+  // 0 kWh Erzeugung nicht hochladen; null/andere Werte bleiben in der CSV
+  if (row.prod_val !== 0) {
+    rows.push(base(row.prod_val, '1-0:2.8.0').join(';'))
+  }
+
+  return rows
 }
 
 function buildCsv(rows: string[]): string {
   return rows.join('\r\n')
+}
+
+function readingValue(raw: unknown): number | null {
+  if (!raw || typeof raw !== 'object') return null
+  const value = Number((raw as Record<string, unknown>).value)
+  return Number.isFinite(value) ? value : null
+}
+
+function hasOverflow(current: number | null, last: number | null): boolean {
+  return current !== null && last !== null && current < last
 }
 
 // ==========================================
@@ -131,49 +146,51 @@ Deno.serve(async (req) => {
     const uploadDate = formatDateDE(new Date())
 
     // 2. Liste 1: Neu akzeptierte Werte (Status 100) -> wird als CSV aufbereitet
-    const { data: acceptedRows, error: acceptedError } = await supabase
-      .from('Process_Database')
-      .select(`
-        id, cons_val, prod_val, reading_date,
-        Customer_PII ( meter_number, melo )
-      `)
-      .eq('kda_status', 100)
-      .gte('last_status_change', sinceIso)
-
-    if (acceptedError) throw new Error(`Accepted-Values konnten nicht geladen werden: ${acceptedError.message}`)
+    const acceptedRows = await fetchAllRows(
+      () => supabase
+        .from('Process_Database')
+        .select(`
+          id, cons_val, prod_val, reading_date, last_cons_reading, last_prod_reading,
+          Customer_PII ( meter_number, melo )
+        `)
+        .eq('kda_status', 100)
+        .gte('last_status_change', sinceIso),
+      { label: 'Accepted-Values' },
+    )
 
     // 3. Liste 2: Neu geschaetzte Werte (Status 50) -> bleibt Rohdaten, kein CSV
-    const { data: estimatedRows, error: estimatedError } = await supabase
-      .from('Process_Database')
-      .select(`
-        id, execution_date, reading_date, cons_val, prod_val, last_cons_reading, last_prod_reading,
-        Customer_PII ( melo )
-      `)
-      .eq('kda_status', 50)
-      .gte('last_status_change', sinceIso)
-
-    if (estimatedError) throw new Error(`Estimated-Values konnten nicht geladen werden: ${estimatedError.message}`)
+    const estimatedRows = await fetchAllRows(
+      () => supabase
+        .from('Process_Database')
+        .select(`
+          id, execution_date, reading_date, cons_val, prod_val, last_cons_reading, last_prod_reading,
+          Customer_PII ( melo )
+        `)
+        .eq('kda_status', 50)
+        .gte('last_status_change', sinceIso),
+      { label: 'Estimated-Values' },
+    )
 
     // 4. Liste 3: Aktuell offene, manuell zu pruefende Faelle (Status 9),
     // aber nur wenn beide Bilder (1.8.0 und 2.8.0) tatsaechlich vorhanden sind
-    const { data: manualCandidates, error: manualError } = await supabase
-      .from('Process_Database')
-      .select(`
-        id,
-        submission_files ( obis_code )
-      `)
-      .eq('kda_status', 9)
+    const manualCandidates = await fetchAllRows(
+      () => supabase
+        .from('Process_Database')
+        .select(`
+          id,
+          submission_files ( obis_code )
+        `)
+        .eq('kda_status', 9),
+      { label: 'Manuelle Faelle' },
+    )
 
-
-    const manualCases = (manualCandidates ?? []).filter(p => {
+    const manualCases = manualCandidates.filter(p => {
       const codes = (p.submission_files ?? []).map((f: any) => f.obis_code)
       return codes.includes('1.8.0') && codes.includes('2.8.0')
     })
 
-    if (manualError) throw new Error(`Manuelle Faelle konnten nicht geladen werden: ${manualError.message}`)
-
     // 5. Accepted-CSV bauen
-    const acceptedCsvRows = (acceptedRows ?? []).flatMap(r => buildCsvRows({
+    const acceptedCsvRows = acceptedRows.flatMap(r => buildCsvRows({
       process_id: r.id,
       meter_number: r.Customer_PII?.meter_number ?? null,
       melo: r.Customer_PII?.melo ?? null,
@@ -239,7 +256,7 @@ Deno.serve(async (req) => {
     }
 
     // Estimated-Faelle bleiben als einfache Objektliste (kein CSV, kein Base64)
-    const estimatedCases = (estimatedRows ?? []).map(r => ({
+    const estimatedCases = estimatedRows.map(r => ({
       process_id: r.id,
       melo: r.Customer_PII?.melo ?? null,
       execution_date: formatDateDE(r.execution_date),
@@ -250,6 +267,26 @@ Deno.serve(async (req) => {
       last_prod_reading: r.last_prod_reading
     }))
 
+    // Liste 4: Ueberlaeufe in derselben Woche wie die Upload-CSV (Status 100).
+    // Der Fall bleibt auf der CSV; Power Automate bekommt MeLo + den Wert,
+    // der unter den letzten Zaehlerstand faellt.
+    const overflowCases = acceptedRows.flatMap(r => {
+      const lastCons = readingValue(r.last_cons_reading)
+      const lastProd = readingValue(r.last_prod_reading)
+      const consOverflow = hasOverflow(r.cons_val, lastCons)
+      const prodOverflow = hasOverflow(r.prod_val, lastProd)
+      if (!consOverflow && !prodOverflow) return []
+
+      return [{
+        process_id: r.id,
+        melo: r.Customer_PII?.melo ?? null,
+        overflow_cons_val: consOverflow ? r.cons_val : null,
+        last_cons_value: consOverflow ? lastCons : null,
+        overflow_prod_val: prodOverflow ? r.prod_val : null,
+        last_prod_value: prodOverflow ? lastProd : null,
+      }]
+    })
+
     // 6. An Power Automate senden
     const payload = {
     secret: reportWebhookSecret,
@@ -257,13 +294,16 @@ Deno.serve(async (req) => {
     report_date: uploadDate,
 
     accepted_file: acceptedFile,
-    accepted_count: acceptedRows?.length ?? 0,
-    accepted_process_ids: (acceptedRows ?? []).map(r => r.id),
+    accepted_count: acceptedRows.length,
+    accepted_process_ids: acceptedRows.map(r => r.id),
 
     estimated_cases: estimatedCases,
     estimated_count: estimatedCases.length,
 
-    manual_review_process_ids: (manualCases ?? []).map(c => c.id)
+    manual_review_process_ids: (manualCases ?? []).map(c => c.id),
+
+    overflow_cases: overflowCases,
+    overflow_count: overflowCases.length
   }
 
     const paResponse = await fetch(powerAutomateWebhookUrl, {
@@ -301,9 +341,10 @@ Deno.serve(async (req) => {
 
     console.log(
       `[Accepted] Report-Job ${jobId} wurde von Power Automate angenommen. ` +
-      `Accepted: ${acceptedRows?.length ?? 0}, ` +
+      `Accepted: ${acceptedRows.length}, ` +
       `Estimated: ${estimatedCases.length}, ` +
-      `Manual: ${manualCases?.length ?? 0}`
+      `Manual: ${manualCases?.length ?? 0}, ` +
+      `Overflow: ${overflowCases.length}`
     )
 
     return new Response(
@@ -312,9 +353,10 @@ Deno.serve(async (req) => {
         status: 'accepted',
         job_id: jobId,
         message: 'Der Report wurde von Power Automate zur Verarbeitung angenommen.',
-        accepted_count: acceptedRows?.length ?? 0,
+        accepted_count: acceptedRows.length,
         estimated_count: estimatedCases.length,
-        manual_count: manualCases?.length ?? 0
+        manual_count: manualCases?.length ?? 0,
+        overflow_count: overflowCases.length
       }),
       {
         status: 202,

@@ -39,3 +39,6 @@ export async function decryptToken(encrypted: string): Promise<string> {
   const plainBuffer = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext)
   return new TextDecoder().decode(plainBuffer)
 }
+
+
+

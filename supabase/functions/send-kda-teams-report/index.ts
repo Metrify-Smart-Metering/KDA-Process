@@ -1,6 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8"
 import { executeSnowflakeQuery } from "../_shared/snowflake/client.ts"
 import { logPipelineRun, RunErrorCollector } from "../_shared/logging.ts"
+import { fetchAllRows } from "../_shared/supabase/fetchAll.ts"
 import { requireSecretApiKey } from "../_shared/utils/auth.ts"
 import { getSupabaseSecretKey, getSupabaseUrl } from "../_shared/utils/env.ts"
 
@@ -226,46 +227,49 @@ Deno.serve(async (req) => {
     // ==========================================
     // 1. DATEN AUS SUPABASE LADEN
     // ==========================================
-    const { data: allProcesses, error: procErr } = await supabase
-      .from('Process_Database')
-      .select(`
-        id,
-        kda_status,
-        created_at,
-        submitted_at,
-        execution_date,
-        customer_label,
-        trigger_id,
-        Customer_PII (
-          customer_f_name,
-          customer_l_name,
-          customer_mail,
-          meter_number,
-          melo
-        )
-      `);
+    const allProcesses = await fetchAllRows(
+      () => supabase
+        .from('Process_Database')
+        .select(`
+          id,
+          kda_status,
+          created_at,
+          submitted_at,
+          execution_date,
+          customer_label,
+          trigger_id,
+          cons_val,
+          prod_val,
+          melo,
+          cons_plausibility_score,
+          prod_plausibility_score,
+          Customer_PII (
+            customer_f_name,
+            customer_l_name,
+            customer_mail,
+            meter_number,
+            melo
+          )
+        `),
+      { label: 'Prozessdaten' },
+    )
 
-    if (procErr || !allProcesses) {
-      throw new Error(`Prozessdaten konnten nicht geladen werden: ${procErr?.message}`);
-    }
-
-    const { data: backlogEntries, error: backlogErr } = await supabase
-      .from('Trigger_Backlog')
-      .select(`
-        Trigger_Candidate_ID,
-        Melo,
-        Org_Exe_Date,
-        last_true_val,
-        Trigger_Type,
-        Ex_Date,
-        Added,
-        Trigger_Status,
-        extra_info
-      `);
-
-    if (backlogErr || !backlogEntries) {
-      throw new Error(`Trigger_Backlog konnte nicht geladen werden: ${backlogErr?.message}`);
-    }
+    const backlogEntries = await fetchAllRows(
+      () => supabase
+        .from('Trigger_Backlog')
+        .select(`
+          Trigger_Candidate_ID,
+          Melo,
+          Org_Exe_Date,
+          last_true_val,
+          Trigger_Type,
+          Ex_Date,
+          Added,
+          Trigger_Status,
+          extra_info
+        `),
+      { label: 'Trigger_Backlog' },
+    )
     // ==========================================
     // 1.5 SYSTEM-GESUNDHEIT DER LETZTEN 7 TAGE (NEU)
     // ==========================================
@@ -279,20 +283,28 @@ Deno.serve(async (req) => {
 
     const sevenDaysAgo = sevenDaysAgoDate.toISOString()
 
-    const { data: recentRuns, error: recentRunsError } = await supabase
-      .from('pipeline_control')
-      .select('job_name, status, errors')
-      .gte('created_at', sevenDaysAgo);
-
-    if (recentRunsError) {
-      console.error(`[Warnung] Systemgesundheit konnte nicht geladen werden: ${recentRunsError.message}`);
+    let recentRuns: { job_name: string; status: string; errors: unknown }[] = []
+    try {
+      recentRuns = await fetchAllRows(
+        () => supabase
+          .from('pipeline_control')
+          .select('job_name, status, errors')
+          .gte('created_at', sevenDaysAgo),
+        { label: 'Systemgesundheit' },
+      )
+    } catch (recentRunsError) {
+      const message =
+        recentRunsError instanceof Error
+          ? recentRunsError.message
+          : String(recentRunsError)
+      console.error(`[Warnung] Systemgesundheit konnte nicht geladen werden: ${message}`)
     }
 
     let fatalAborts = 0;
     let totalErrors = 0;
     let totalWarnings = 0;
 
-    for (const run of recentRuns ?? []) {
+    for (const run of recentRuns) {
       if (run.status === 'error') fatalAborts++;
       const entries = (run.errors ?? []) as { type: string }[];
       totalErrors += entries.filter(e => e.type === 'error').length;
@@ -324,9 +336,22 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
           CUSTOMER_L_NAME VARCHAR,
           METER_NUMBER VARCHAR,
           CREATED_AT TIMESTAMP_TZ,
-          SUBMITTED_AT TIMESTAMP_TZ
+          SUBMITTED_AT TIMESTAMP_TZ,
+          CONS_VAL FLOAT,
+          PROD_VAL FLOAT,
+          MELO VARCHAR,
+          CONS_PLAUSIBILITY_SCORE FLOAT,
+          PROD_PLAUSIBILITY_SCORE FLOAT
         )
       `);
+
+      // Bestehende Tabellen bekommen die neuen Spalten nachgezogen.
+      // CREATE TABLE IF NOT EXISTS aendert vorhandene Tabellen nicht.
+      await executeSnowflakeQuery('primary', `ALTER TABLE OPERATIONS_SANDBOX.KDA.KDA_PROCESS_DATABASE ADD COLUMN IF NOT EXISTS CONS_VAL FLOAT`)
+      await executeSnowflakeQuery('primary', `ALTER TABLE OPERATIONS_SANDBOX.KDA.KDA_PROCESS_DATABASE ADD COLUMN IF NOT EXISTS PROD_VAL FLOAT`)
+      await executeSnowflakeQuery('primary', `ALTER TABLE OPERATIONS_SANDBOX.KDA.KDA_PROCESS_DATABASE ADD COLUMN IF NOT EXISTS MELO VARCHAR`)
+      await executeSnowflakeQuery('primary', `ALTER TABLE OPERATIONS_SANDBOX.KDA.KDA_PROCESS_DATABASE ADD COLUMN IF NOT EXISTS CONS_PLAUSIBILITY_SCORE FLOAT`)
+      await executeSnowflakeQuery('primary', `ALTER TABLE OPERATIONS_SANDBOX.KDA.KDA_PROCESS_DATABASE ADD COLUMN IF NOT EXISTS PROD_PLAUSIBILITY_SCORE FLOAT`)
 
       await executeSnowflakeQuery('primary', `
         CREATE TABLE IF NOT EXISTS OPERATIONS_SANDBOX.KDA.KDA_TRIGGER_BACKLOG (
@@ -354,6 +379,8 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
           const customer_l_name = Array.isArray(pii) ? pii[0]?.customer_l_name : pii?.customer_l_name;
           const customer_mail = Array.isArray(pii) ? pii[0]?.customer_mail : pii?.customer_mail;
           const meter_number = Array.isArray(pii) ? pii[0]?.meter_number : pii?.meter_number;
+          const piiMelo = Array.isArray(pii) ? pii[0]?.melo : pii?.melo;
+          const melo = p.melo ?? piiMelo;
 
           return `(
             ${formatSqlNumber(p.id)},
@@ -366,7 +393,12 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
             ${escapeSqlString(customer_l_name)},
             ${escapeSqlString(meter_number)},
             ${formatSqlTimestamp(p.created_at)},
-            ${formatSqlTimestamp(p.submitted_at)}
+            ${formatSqlTimestamp(p.submitted_at)},
+            ${formatSqlNumber(p.cons_val)},
+            ${formatSqlNumber(p.prod_val)},
+            ${escapeSqlString(melo)},
+            ${formatSqlNumber(p.cons_plausibility_score)},
+            ${formatSqlNumber(p.prod_plausibility_score)}
           )`;
         }).join(",\n");
 
@@ -374,7 +406,8 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
           INSERT INTO OPERATIONS_SANDBOX.KDA.KDA_PROCESS_DATABASE (
             ID, EXECUTION_DATE, KDA_STATUS, CUSTOMER_LABEL, TRIGGER_ID, 
             CUSTOMER_MAIL, CUSTOMER_F_NAME, CUSTOMER_L_NAME, METER_NUMBER, 
-            CREATED_AT, SUBMITTED_AT
+            CREATED_AT, SUBMITTED_AT,
+            CONS_VAL, PROD_VAL, MELO, CONS_PLAUSIBILITY_SCORE, PROD_PLAUSIBILITY_SCORE
           ) VALUES ${procValues}
         `);
       }

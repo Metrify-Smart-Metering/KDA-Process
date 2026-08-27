@@ -249,9 +249,14 @@ Deno.serve(async (req) => {
 
     if (filesToInsert.length > 0) {
       console.log(`[DB] Trage ${filesToInsert.length} Bilder in submission_files ein...`);
+      // Upsert statt Insert: Unique (process_id, obis_code).
+      // CS-Override kann beim ersten Submit am Foto-Trigger scheitern, nachdem
+      // 1.8.0 schon geschrieben wurde. Ein zweiter Versuch mit beiden Fotos
+      // wuerde sonst an genau dieser Unique-Constraint haengen bleiben.
+      // Kunden-Submit: gleiches Foto nochmal -> Zeile wird aktualisiert, kein Duplikat.
       const { error: fileError } = await supabase
         .from('submission_files')
-        .insert(filesToInsert)
+        .upsert(filesToInsert, { onConflict: 'process_id,obis_code' })
 
       if (fileError) {
         collector.error(`Bilddaten-Verknüpfung fehlgeschlagen: ${fileError.message}`, { process_id })

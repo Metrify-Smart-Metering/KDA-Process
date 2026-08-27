@@ -11,99 +11,55 @@ Das Projekt besteht aus **Supabase Edge Functions**, die Trigger-Daten aus **Sno
 - [Automatisierung: Trigger, Webhooks und Cronjobs](#-automatisierung-trigger-webhooks-und-cronjobs)
 - [Zentrale Komponenten](#-zentrale-komponenten)
 - [Datenfluss](#-datenfluss)
+- [CS-Override](#-cs-override)
 - [Prozessstatus](#-prozessstatus)
 - [Technologie-Stack](#-technologie-stack)
 - [Voraussetzungen](#-voraussetzungen)
 - [Konfiguration](#-konfiguration)
 - [Quick Start](#-quick-start)
-- [Lokale Prüfung](#-lokale-prüfung)
 - [Wichtige Hinweise](#-wichtige-hinweise)
 
 ## 🏗️ Ordnerstruktur und Architektur
 
 Die bereitgestellte Codebase ist als Sammlung unabhängig deploybarer **Supabase Edge Functions** organisiert. Jede Funktion besitzt einen eigenen Einstiegspunkt und kann separat ausgelöst, getestet und veröffentlicht werden. Wiederverwendbare Infrastruktur liegt unter `_shared`.
 
-Postgres-RPCs der Pipeline (Catch/Select/Insert) liegen unter
+Postgres-RPCs der Pipeline (Catch/Select/Insert) sowie CS-Override liegen unter
 `supabase/database_functions/` und werden per
 `supabase db query --linked -f …` bzw. `.\supabase\database_functions\deploy.ps1`
-deployt — nicht über Edge-Function-Deploy und nicht über neue Migrations.
+oder im Supabase-SQL-Editor deployt — nicht über Edge-Function-Deploy.
 
 ```text
 KDA-Process/
 └── supabase/
-    ├── database_functions/   # Postgres-RPCs (Source of Truth)
+    ├── database_functions/   # Postgres-RPCs und Trigger (Source of Truth)
     └── functions/
         ├── _shared/
         │   ├── logging.ts
         │   ├── tokenCrypto.ts
+        │   ├── csOverride.ts
         │   ├── snowflake/
-        │   │   ├── client.ts
-        │   │   ├── config.ts
-        │   │   ├── identifiers.ts
-        │   │   ├── jwt.ts
-        │   │   ├── jwt_old.ts
-        │   │   ├── meta.ts
-        │   │   ├── types.ts
-        │   │   └── use-case-routing.ts
         │   └── utils/
-        │       └── env.ts
-        │
+        │       ├── env.ts
+        │       └── auth.ts
+        ├── list_cs_fill_processes/
+        ├── issue_cs_override/
+        ├── cancel_cs_override/
+        ├── manual_process_preview/
+        ├── manual_process_create/
         ├── create_upload_url/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── evaluate-plausibility/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── Get_Trigger_Data/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── handle-email-events/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── insert_new_process/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── open_process/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── Select_KDA_Process_From_Trigger/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── send-kda-reminders/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── send-kda-teams-report/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── send-portal-link/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── send-weekly-kda-report/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── submit_process/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         ├── submit_reviewed_values/
-        │   ├── .npmrc
-        │   ├── deno.json
-        │   └── index.ts
         └── test-snowflake-connection/
-            ├── .npmrc
-            ├── deno.json
-            └── index.ts
 ```
 
 ### Architekturrollen
@@ -114,6 +70,8 @@ KDA-Process/
 | `supabase/functions/<function>/index.ts`  | HTTP-Handler einer eigenständig deploybaren Edge Function. Enthält Request-Verarbeitung, fachliche Logik und Aufrufe externer Systeme. |                                
 | `_shared/logging.ts`                      | Einheitliches Laufprotokoll in `pipeline_control`, Sammlung nicht-fataler Fehler und Teams-Alarmierung bei fatalen Abbrüchen.          |
 | `_shared/tokenCrypto.ts`                  | Reversible AES-256-GCM-Verschlüsselung von Magic-Link-Tokens für Reminder-Mails.                                                       |
+| `_shared/csOverride.ts`                   | Token-Erzeugung, Tab-Konstante `cs-kda-fill-out` und Permission-Check für den CS-Override.                                             |
+| `_shared/utils/auth.ts`                   | `requireSecretApiKey` (Jobs) und `requireUser` (eingeloggte interne Nutzer).                                                           |
 | `_shared/snowflake/client.ts`             | Zugriff auf die Snowflake SQL API einschließlich Parameter-Bindings und Polling asynchroner Statements.                                |
 | `_shared/snowflake/config.ts`             | Lädt Snowflake-Profile aus Umgebungsvariablen. Unterstützt `primary` und `secondary`.                                                  |
 | `_shared/snowflake/jwt.ts`                | Erstellt und cached Key-Pair-JWTs für die Snowflake-Authentifizierung.                                                                 |
@@ -148,6 +106,7 @@ Die fachliche Verarbeitung wird durch PostgreSQL-Trigger, HTTP-Aufrufe an Edge F
 | `trg_delete_orphan_customer_pii` | `AFTER DELETE`                                                    | Führt `delete_orphan_customer_pii()` aus                           | Löscht verwaiste Kundendaten, wenn kein Prozess mehr auf sie verweist.                                                                          |
 | `trg_set_last_status_change`     | `BEFORE UPDATE`                                                   | Führt `set_last_status_change()` aus                               | Pflegt den Zeitstempel für Statusänderungen, der unter anderem im inkrementellen Wochenreport verwendet wird.                                   |
 | `trigger_cleanup_pii`            | `AFTER UPDATE OF kda_status`, wenn der Status auf `1000` wechselt | Führt `delete_pii_on_completion()` aus                             | Entfernt PII nach abgeschlossenem Export des Prozesses.                                                                                         |
+| `trg_enforce_cs_override_photos` | `BEFORE UPDATE OF kda_status` auf `4`                             | Führt `enforce_cs_override_photos()` aus                           | Bei laufendem CS-Override: Bezugsfoto Pflicht, Einspeisefoto nur wenn `prod_val > 0`; setzt `submitted_via`.                                    |
 
 
 ### Datenbank-Trigger auf `public.pipeline_control`
@@ -202,9 +161,12 @@ Die Tabelle beziehungsweise Struktur `supabase_functions.hooks` dient als **Audi
 | 3   | `0 4 * * 1-5` | Montag bis Freitag um 04:00 Uhr | HTTP-POST auf `/functions/v1/Get_Trigger_Data`       |
 | 4   | `0 7 * * 1`   | Montag um 07:00 Uhr             | HTTP-POST auf `/functions/v1/send-weekly-kda-report` |
 | 5   | `15 3 * * 7`  | Sonntag um 03:15 Uhr            | Führt `select public.delete_old_customer_pii();` aus |
-| 6   | `0 2 * * *`   | Täglich um 02:00 UTC            | Führt `select public.retry_open_plausibility_checks();` aus |
+| 6   | `0 2 * * *`       | Täglich um 02:00 UTC                    | Führt `select public.retry_open_plausibility_checks();` aus |
+| 7   | `*/10 * * * 1-5`  | Mo–Fr alle 10 Minuten (Fenster in der Function: 08:00–20:00 Europe/Berlin) | Führt `select public.restore_expired_cs_overrides();` aus |
 
 Job 6 schickt alle Prozesse mit `kda_status = 4` erneut durch `evaluate-plausibility`. Status 4 ist ein Durchgangsstatus; bleibt ein Prozess dort liegen (z. B. weil der einmalige Trigger-Aufruf ausgefallen ist), wird er in der Nacht nachgeholt.
+
+Job 7 beendet abgelaufene CS-Übernahmen und belebt den originalen Kunden-Token wieder. Das 8–20-Uhr-Fenster rechnet die Function in `Europe/Berlin`; der Cron-Ausdruck selbst folgt der `pg_cron`-Zeitzone (UTC-Wochentage).
 
 
 > [!IMPORTANT]
@@ -240,8 +202,8 @@ Diese Trigger sollten nicht als KDA-Fachlogik verändert oder entfernt werden.
 | `send-portal-link`    | Erzeugt einen Magic Link, speichert Hash und verschlüsselten Token und versendet die erste E-Mail über SendGrid.                                       | `Process_Database`, `Customer_PII`, `customer_labels`, `Trigger_Config`, `access_tokens`, SendGrid   |
 | `open_process`        | Validiert Prozess-ID, Token, Ablaufdatum und Kunden-PLZ und liefert die für das Portal benötigten Prozessdaten.                                        | `access_tokens`, `Process_Database`, `Customer_PII`, `Trigger_Config`                                |
 | `create_upload_url`   | Validiert Token und PLZ und erstellt eine signierte Upload-URL für Zählerbilder im privaten Storage-Bucket.                                            | `access_tokens`, `Process_Database`, Supabase Storage                                                |
-| `submit_process`      | Speichert Zählerstände und Bildreferenzen, setzt den Prozess auf Status `4`, entwertet den Token und versendet eine Bestätigung.                       | `Process_Database`, `Customer_PII`, `customer_labels`, `submission_files`, `access_tokens`, SendGrid |
-| `send-kda-reminders`  | Versendet zeitgesteuerte Reminder, verwendet den bestehenden verschlüsselten Token erneut und setzt den Prozess nach Ablauf auf den Schätzwert-Status. | `Process_Database`, `Trigger_Config`, `Customer_PII`, `customer_labels`, `access_tokens`, SendGrid   |
+| `submit_process`      | Speichert Zählerstände und Bildreferenzen (`upsert` auf `submission_files`), setzt den Prozess auf Status `4`, entwertet den Token und versendet eine Bestätigung. | `Process_Database`, `Customer_PII`, `customer_labels`, `submission_files`, `access_tokens`, SendGrid |
+| `send-kda-reminders`  | Versendet zeitgesteuerte Reminder; überspringt Prozesse mit noch gültigem CS-Override; verwendet nur Tokens mit `encrypted_token`. Nach Fristablauf Status `50`. | `Process_Database`, `Trigger_Config`, `Customer_PII`, `customer_labels`, `access_tokens`, SendGrid   |
 | `handle-email-events` | Verarbeitet SendGrid-Events für das KDA-System und setzt offene Prozesse bei `bounce` oder `dropped` auf Status `404`.                                 | SendGrid Event Webhook, `Process_Database`, `Customer_PII`                                           |
 
 
@@ -251,9 +213,20 @@ Diese Trigger sollten nicht als KDA-Fachlogik verändert oder entfernt werden.
 | Function                 | Verantwortung                                                                                                                                                             | Wichtige Datenquellen/-ziele                                      |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `evaluate-plausibility`  | Reagiert auf eingereichte Werte, ruft die Snowflake-Plausibilitätsprüfung auf und entscheidet zwischen akzeptiert, manuellem Review, Schätzung oder Wiederholungsprozess. | `Process_Database`, `Customer_PII`, `submission_files`, Snowflake |
-| `submit_reviewed_values` | Ermöglicht authentifizierten internen Nutzern, einen Fall im Status `9` zu akzeptieren oder auf Schätzung zu setzen.                                                      | Supabase Auth, RLS, `Process_Database`                            |
+| `submit_reviewed_values` | Ermöglicht authentifizierten internen Nutzern, einen Fall im Status `9` zu akzeptieren (`100`), zu schätzen (`50`), einen Folgeprozess anzulegen oder zu dismissen (`999`). Dismiss läuft über service_role. | Supabase Auth, RLS, `Process_Database` |
 | `manual_process_preview` | Zeigt authentifizierten internen Nutzern die Snowflake-Daten (PII, Zählernummer, Zählerstände) zu einer manuell eingegebenen Melo, inkl. Zählernummer-Abgleich und Block-Gründen. Legt nichts an. | Supabase Auth, `Trigger_Config`, Snowflake |
 | `manual_process_create`  | Legt für eine manuell eingegebene Melo einen KDA-Prozess an (Trigger-Typ `manual_kda`), zieht die Daten frisch aus Snowflake und blockt bei fehlenden Pflichtdaten. Löst den Portal-Link-Versand aus. | Supabase Auth, Snowflake, `create_manual_process`, `Customer_PII`, `Process_Database` |
+
+
+### CS-Override (Kundenservice füllt das Kundenformular)
+
+
+| Function / RPC              | Verantwortung                                                                                                                                 | Wichtige Datenquellen/-ziele                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `list_cs_fill_processes`    | Melo-Suche: offene Fälle (Status 1/2/3). JWT + Zeile in `kda_tab_permission` (`cs-kda-fill-out`).                                             | `Process_Database`, `Customer_PII`, `access_tokens`   |
+| `issue_cs_override`         | Pausiert den Kunden-Token (`used_at` + `suspended_by_cs_at`), legt einen kurzlebigen CS-Token ohne `encrypted_token` an, gibt `portal_url` zurück. Nur Mo–Fr 08:00–19:29 Europe/Berlin. | `access_tokens`, `PORTAL_URL`                         |
+| `cancel_cs_override`        | Beendet die Übernahme sofort (gleiche RPC wie der Cron, mit `process_id`).                                                                    | `restore_expired_cs_overrides`                        |
+| `restore_expired_cs_overrides` | Cron/Abbrechen: CS-Token verbrauchen, Kunden-Token wiederbeleben wenn der Fall noch offen ist.                                             | `access_tokens`, `Process_Database`                   |
 
 
 ### Reporting und Betrieb
@@ -337,6 +310,33 @@ send-portal-link
 
 Für Bild-Uploads werden ausschließlich die OBIS-Codes `1.8.0` und `2.8.0` akzeptiert. Die Dateien liegen laut Code im privaten Supabase-Storage-Bucket `meter-readings_pics` unter einem prozessbezogenen Pfad.
 
+### 2b. CS-Override (parallel zum Kundenlink)
+
+```text
+CS-Tab (kda_tab_permission: cs-kda-fill-out)
+        │
+        ▼
+list_cs_fill_processes { melo }
+        │  offene Fälle Status 1/2/3
+        ▼
+issue_cs_override { process_id, ticket_id }
+        ├─ Kunden-Token pausieren (used_at + suspended_by_cs_at)
+        ├─ CS-Token ohne encrypted_token, TTL 20 Minuten
+        └─ portal_url = PORTAL_URL?id=&t=
+                │
+                ▼
+         dasselbe Kundenportal
+                │
+                └─ submit_process (wie Kunde)
+                     ├─ Trigger enforce_cs_override_photos
+                     ├─ submitted_via = cs_override
+                     └─ gleiche Bestätigungsmail
+
+Abbrechen / Ablauf
+        ├─ cancel_cs_override
+        └─ pg_cron restore_expired_cs_overrides (Mo–Fr, 08:00–20:00 Berlin)
+```
+
 ### 3. Plausibilitätsprüfung
 
 ```text
@@ -364,6 +364,7 @@ Die Schwelle für die Implausibilitätsentscheidung ist im bereitgestellten Code
 ```text
 Geplanter Aufruf
    ├─ send-kda-reminders
+   │    ├─ überspringt Fälle mit gültigem CS-Override
    │    ├─ Reminder / Eskalation per SendGrid
    │    └─ nach Fristablauf Status 50
    │
@@ -378,6 +379,21 @@ SendGrid Event Webhook
    └─ handle-email-events
         └─ bounce/dropped → Status 404
 ```
+
+## 🧑‍💼 CS-Override
+
+Kundenservice füllt **dasselbe Kundenportal** aus, wenn Kundinnen per E-Mail Zählerstände schicken. Es gibt kein zweites Formular. Der Agent öffnet `PORTAL_URL?id=&t=` in einem neuen Tab und gibt die PLZ wie der Kunde ein.
+
+| Regel | Details |
+| --- | --- |
+| Berechtigung | Zeile in `kda_tab_permission` mit `tab = cs-kda-fill-out`. Frontend darf `Process_Database` nicht direkt listen (SELECT-RLS ist weit). |
+| Zeitfenster | Issue nur Mo–Fr, 08:00 bis vor 19:30 Europe/Berlin. Abbrechen jederzeit. |
+| Token | Kunden-Token wird pausiert (`used_at` + `suspended_by_cs_at`). CS-Token: `token_type = cs_override`, kein `encrypted_token`, TTL 20 Minuten. Ein unbenutzter Override pro Prozess. |
+| Fotos | Bezugsfoto (`1.8.0`) immer; Einspeisefoto (`2.8.0`) nur wenn `prod_val > 0`. Erzwungen per Trigger beim Wechsel auf Status 4. |
+| Restore | Cron alle 10 Minuten (UTC-Wochentage); Function macht außerhalb 08:00–20:00 Berlin nichts. Belebt den Kunden-Token nur, wenn der Fall noch offen ist (Status 1/2/3). |
+| SQL | Dateien unter `supabase/database_functions/`. Reihenfolge: `cs_override_schema.sql`, dann `list_cs_fill_processes.sql`, `issue_cs_override.sql`, `restore_expired_cs_overrides.sql`, `enforce_cs_override_photos.sql`. Härtung: `kda_has_tab.sql`, `harden_process_database_rls.sql`. |
+
+Auth-Muster wie bei `submit_reviewed_values`: `verify_jwt = false`, Nutzer-JWT in `Authorization`, Publishable Key nur in `apikey`. Die Functions prüfen `auth.uid()` gegen `kda_tab_permission`.
 
 ## 🚦 Prozessstatus
 
@@ -394,6 +410,7 @@ Die folgenden Statuswerte sind in den bereitgestellten Functions und im Teams-Re
 | `9`    | Unplausibler Wert beziehungsweise manueller Review erforderlich            |
 | `50`   | Ersatzwert/Schätzung                                                       |
 | `100`  | Wert akzeptiert                                                            |
+| `999`  | Fall dismissed (interner Review, nur Übergang von Status `9`)              |
 | `404`  | E-Mail konnte nicht zugestellt werden                                      |
 | `1000` | Akzeptierter Wert wurde in den Massen-/Wochenexport übernommen             |
 
@@ -410,7 +427,7 @@ Die folgenden Statuswerte sind in den bereitgestellten Functions und im Teams-Re
 | Runtime           | Deno                                                             | Laufzeit der Supabase Edge Functions                                      |
 | Backend           | Supabase Edge Functions                                          | Serverlose HTTP-Endpunkte und Webhook-Handler                             |
 | Datenbank         | Supabase PostgreSQL / PostgREST                                  | Prozess-, PII-, Trigger- und Logging-Daten                                |
-| Authentifizierung | Supabase Auth + RLS                                              | Interner manueller Review in `submit_reviewed_values`                     |
+| Authentifizierung | Supabase Auth + RLS                                              | Interner Review, manuelle Anlage, CS-Override (`kda_has_tab` / `kda_tab_permission`) |
 | Object Storage    | Supabase Storage                                                 | Private Speicherung von Zählerbildern                                     |
 | Data Warehouse    | Snowflake SQL API                                                | Trigger-Quellen, PII-/Fachdaten, Plausibilitätsprüfung und Reporting-Sync |
 | Snowflake Auth    | RSA Key-Pair JWT / RS256                                         | Authentifizierung gegenüber der Snowflake SQL API                         |
@@ -456,8 +473,8 @@ supabase/.env.local
 | `SUPABASE_URL`               | Ja                           | URL des Supabase-Projekts                                                     |
 | `SUPABASE_SECRET_KEYS`       | Ja                           | Von Supabase gesetztes JSON-Objekt `{ "<name>": "sb_secret_..." }`            |
 | `SECRET_KEY_NAME`            | Ja                           | Name des zu verwendenden Secret Keys, üblicherweise `default`                 |
-| `SUPABASE_PUBLISHABLE_KEYS`  | Für `submit_reviewed_values` | Von Supabase gesetztes JSON-Objekt `{ "<name>": "sb_publishable_..." }`       |
-| `PUBLISHABLE_KEY_NAME`       | Für `submit_reviewed_values` | Name des zu verwendenden Publishable Keys, üblicherweise `default`            |
+| `SUPABASE_PUBLISHABLE_KEYS`  | Für interne UI-Functions | Von Supabase gesetztes JSON-Objekt `{ "<name>": "sb_publishable_..." }`       |
+| `PUBLISHABLE_KEY_NAME`       | Für interne UI-Functions | Name des zu verwendenden Publishable Keys, üblicherweise `default`            |
 
 Die Legacy-Variablen `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_SECRET_KEY` und `SUPABASE_ANON_KEY` werden nicht mehr gelesen.
 
@@ -471,7 +488,7 @@ Die Legacy-Variablen `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_SECRET_KEY` und `SUP
 | Variable               | Pflicht                     | Verwendung                                                               |
 | ---------------------- | :---------------------------: | ------------------------------------------------------------------------ |
 | `TOKEN_ENCRYPTION_KEY` | Ja für Magic Links/Reminder | Base64-kodierter Schlüssel mit exakt 32 Byte für AES-256-GCM             |
-| `PORTAL_URL`           | Für produktiven Mailversand | Basis-URL des Kundenportals; im Code existiert nur ein Beispiel-Fallback |
+| `PORTAL_URL`           | Für Mailversand und CS-Links | Basis-URL des Kundenportals (`?id=` + `&t=`); im Code existiert nur ein Beispiel-Fallback |
 
 
 Einen lokalen Schlüssel erzeugst du beispielsweise mit PowerShell:
@@ -583,28 +600,26 @@ Nach dem Start zeigt die CLI unter anderem die lokale API-URL sowie Anon- und Se
 ### Zentrale Supabase-Tabellen
 
 
-| Tabelle            | Zweck                                                                                         |
-| ------------------ | --------------------------------------------------------------------------------------------- |
-| `Trigger_Config`   | Fachliche Trigger-Konfiguration, Prioritäten, Vorlauf-/Lockout-Zeiten und Reminder-Intervalle |
-| `Trigger_Backlog`  | Kandidaten aus Snowflake einschließlich Auswahlstatus und Audit-Informationen                 |
-| `Process_Database` | Zentraler Zustand jedes KDA-Prozesses                                                         |
-| `Customer_PII`     | Personenbezogene Kunden- und Messstelleninformationen                                         |
-| `customer_labels`  | Branding-, Absender- und Support-Konfiguration je Kundenlabel                                 |
-| `access_tokens`    | Token-Hash, verschlüsselter Token, Ablauf und Nutzungszeitpunkt                               |
-| `submission_files` | Referenzen auf hochgeladene Zählerbilder und OBIS-Zuordnung                                   |
-| `pipeline_control` | Laufstatus, Dauer, Warnungen und Fehler der Functions                                         |
+| Tabelle               | Zweck                                                                                         |
+| --------------------- | --------------------------------------------------------------------------------------------- |
+| `Trigger_Config`      | Fachliche Trigger-Konfiguration, Prioritäten, Vorlauf-/Lockout-Zeiten und Reminder-Intervalle |
+| `Trigger_Backlog`     | Kandidaten aus Snowflake einschließlich Auswahlstatus und Audit-Informationen                 |
+| `Process_Database`    | Zentraler Zustand jedes KDA-Prozesses; `submitted_via` markiert CS-Einreichungen              |
+| `Customer_PII`        | Personenbezogene Kunden- und Messstelleninformationen                                         |
+| `customer_labels`     | Branding-, Absender- und Support-Konfiguration je Kundenlabel                                 |
+| `access_tokens`       | Token-Hash, optional verschlüsselter Token, Ablauf, `token_type`, `suspended_by_cs_at`, `issued_by`, `ticket_id` |
+| `kda_tab_permission`  | Welche internen Nutzer welchen Portal-Tab sehen (`user_id`, `tab`, `user_email`)              |
+| `submission_files`    | Referenzen auf hochgeladene Zählerbilder und OBIS-Zuordnung                                   |
+| `pipeline_control`    | Laufstatus, Dauer, Warnungen und Fehler der Functions                                         |
 
 
 ### Verantwortungsgrenzen
 
-Dieses Repository enthält den serverseitigen KDA-Workflow. Nicht erkennbar beziehungsweise nicht mitgeliefert sind:
+Dieses Repository enthält den serverseitigen KDA-Workflow. Postgres-RPCs und Trigger liegen unter `supabase/database_functions/`. Edge Functions: `verify_jwt = false`; Secret/Publishable Key nur im `apikey`-Header, Nutzer-JWT in `Authorization`.
 
-- das Kundenportal/Frontend -->https://github.com/Metrify-Smart-Metering/kda-portal,
-- SQL-Migrationen und RLS-Policies,
-- Supabase-Projektkonfiguration,
-- die SQL-Migrationen beziehungsweise produktiven Definitionen der beschriebenen Database Webhooks und Cronjobs,
-- SendGrid-Templates,
-- Teams-/Power-Automate-Workflows,
-- CI/CD-Pipeline und automatisierte Tests.
+Nicht mitgeliefert sind:
 
-Ergänze für diese Bestandteile Links zu den jeweiligen Repositories oder Betriebsdokumentationen, damit neue Entwickler nicht auf Schatzsuche gehen müssen — wir sind hier schließlich nicht im Hamburger Hafen auf Nebelfahrt.
+- das Kundenportal/Frontend: https://github.com/Metrify-Smart-Metering/kda-portal
+- SendGrid-Templates
+- Teams-/Power-Automate-Workflows
+- CI/CD-Pipeline und automatisierte Tests

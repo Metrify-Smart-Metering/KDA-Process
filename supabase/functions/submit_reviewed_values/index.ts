@@ -118,10 +118,8 @@ Deno.serve(async (req) => {
       }
     }
 
-    // dismiss setzt kda_status 999. Live-RLS/WITH CHECK kennt den Wert
-    // oft noch nicht (Allowlist ohne 999, oder Lookup-Zeile fehlt).
-    // Wie beim Wiederholungs-Insert deshalb service_role; der Reviewer
-    // ist oben bereits per JWT geprueft.
+    // dismiss setzt kda_status 999. JWT-RLS erlaubt 9 -> 999; der Pfad
+    // bleibt service_role (wie Wiederholungs-Insert), Reviewer ist per JWT geprueft.
     const updateClient = action === 'dismiss' ? supabaseAdmin : supabase
     const { error: updateError, data } = await updateClient
       .from('Process_Database')

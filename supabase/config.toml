@@ -582,3 +582,22 @@ entrypoint = "./functions/test/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/test/*.html" ]
+
+# CS-Override: JWT wird in der Function via requireUser geprueft (wie Review).
+[functions.list_cs_fill_processes]
+enabled = true
+verify_jwt = false
+import_map = "./functions/list_cs_fill_processes/deno.json"
+entrypoint = "./functions/list_cs_fill_processes/index.ts"
+
+[functions.issue_cs_override]
+enabled = true
+verify_jwt = false
+import_map = "./functions/issue_cs_override/deno.json"
+entrypoint = "./functions/issue_cs_override/index.ts"
+
+[functions.cancel_cs_override]
+enabled = true
+verify_jwt = false
+import_map = "./functions/cancel_cs_override/deno.json"
+entrypoint = "./functions/cancel_cs_override/index.ts"
