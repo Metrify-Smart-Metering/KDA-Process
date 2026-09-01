@@ -601,3 +601,10 @@ enabled = true
 verify_jwt = false
 import_map = "./functions/cancel_cs_override/deno.json"
 entrypoint = "./functions/cancel_cs_override/index.ts"
+
+# Einmaliger Re-Export der Massenupload-CSV fuer ein Callback-Datum (kda_status 1000).
+[functions.recreate-mass-upload-file]
+enabled = true
+verify_jwt = false
+import_map = "./functions/recreate-mass-upload-file/deno.json"
+entrypoint = "./functions/recreate-mass-upload-file/index.ts"

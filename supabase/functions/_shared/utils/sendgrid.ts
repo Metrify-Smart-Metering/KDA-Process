@@ -11,6 +11,28 @@ export const SENDGRID_MAIL_SETTINGS = {
   },
 } as const
 
+/**
+ * Tracking pro Nachricht aus. Ueberschreibt Account-Defaults, damit SendGrid
+ * Magic Links nicht auf url.ct.sendgrid.net umschreibt (Click-Tracking) und
+ * keinen Open-Pixel einbettet. enable_text: false verhindert Umschreiben in
+ * text/plain, das URLs oft umbricht.
+ */
+export const SENDGRID_TRACKING_SETTINGS = {
+  click_tracking: {
+    enable: false,
+    enable_text: false,
+  },
+  open_tracking: {
+    enable: false,
+  },
+  subscription_tracking: {
+    enable: false,
+  },
+  ganalytics: {
+    enable: false,
+  },
+} as const
+
 export type CustomerMailType =
   | 'first_mail'
   | 'second_mail'
@@ -151,6 +173,7 @@ export async function sendDynamicTemplateMail(params: {
       subject: params.subject,
       template_id: params.templateId,
       mail_settings: SENDGRID_MAIL_SETTINGS,
+      tracking_settings: SENDGRID_TRACKING_SETTINGS,
     }),
   })
 
