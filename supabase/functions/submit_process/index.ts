@@ -9,6 +9,7 @@ import {
   sendDynamicTemplateMail,
   type CustomerLabelMailRow,
 } from "../_shared/utils/sendgrid.ts"
+import { buildSalesforceSyncText, syncCustomerToSalesforce } from "../_shared/utils/salesforceSync.ts"
 
 const JOB_NAME = 'submit_process'
 
@@ -193,7 +194,7 @@ Deno.serve(async (req) => {
     console.log(`[Load] Lade PII für ID ${processData.customer_pii_id}...`);
     const { data: piiData, error: piiError } = await supabase
       .from('Customer_PII')
-      .select('customer_mail, customer_f_name, customer_l_name, meter_number')
+      .select('customer_mail, customer_f_name, customer_l_name, meter_number, customer_gcid')
       .eq('id', processData.customer_pii_id)
       .single()
 
@@ -316,6 +317,17 @@ Deno.serve(async (req) => {
             ...brandTemplateData(branding),
           },
         })
+
+        try {
+          const syncResult = await syncCustomerToSalesforce({
+            gcid: piiData.customer_gcid,
+            text: buildSalesforceSyncText('submission_mail'),
+          })
+          console.log(`[SalesforceSync] Ergebnis für Prozess ${process_id}: ${syncResult}`)
+        } catch (syncError) {
+          console.error(`[SalesforceSync] Fehlgeschlagen für Prozess ${process_id}:`, syncError)
+          collector.warn(`Salesforce-Sync fehlgeschlagen (Mail wurde trotzdem versendet): ${syncError instanceof Error ? syncError.message : String(syncError)}`, { process_id })
+        }
       } else {
         console.warn(`Bestaetigungs-E-Mail fuer Prozess ${process_id} wurde uebersprungen, da Daten oder SENDGRID_API_KEY fehlen.`)
       }

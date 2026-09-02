@@ -2,7 +2,7 @@
 
 > Automatisierter Backend-Workflow für die Auswahl, Eröffnung, Bearbeitung und Auswertung von KDA-Prozessen rund um Zählerstände.
 
-Das Projekt besteht aus **Supabase Edge Functions**, die Trigger-Daten aus **Snowflake** übernehmen, KDA-Fälle in **Supabase/PostgreSQL** verwalten, Kundinnen und Kunden über **SendGrid** kontaktieren, Zählerstände und Belegbilder entgegennehmen, Werte auf Plausibilität prüfen und Ergebnisse an **Microsoft Teams**, **Power Automate** und Snowflake weitergeben.
+Das Projekt besteht aus **Supabase Edge Functions**, die Trigger-Daten aus **Snowflake** übernehmen, KDA-Fälle in **Supabase/PostgreSQL** verwalten, Kundinnen und Kunden über **SendGrid** kontaktieren, Zählerstände und Belegbilder entgegennehmen, Werte auf Plausibilität prüfen und Ergebnisse an **Microsoft Teams**, **Power Automate**, **Salesforce** (über Make/Celonis) und Snowflake weitergeben.
 ## Wichtige Links
 - Git von dem Frontend: https://github.com/Metrify-Smart-Metering/kda-portal
 - Miro: https://miro.com/app/board/uXjVGqfVpFA=/?share_link_id=126216699187
@@ -39,7 +39,9 @@ KDA-Process/
         │   ├── snowflake/
         │   └── utils/
         │       ├── env.ts
-        │       └── auth.ts
+        │       ├── auth.ts
+        │       ├── sendgrid.ts
+        │       └── salesforceSync.ts
         ├── list_cs_fill_processes/
         ├── issue_cs_override/
         ├── cancel_cs_override/
@@ -79,6 +81,8 @@ KDA-Process/
 | `_shared/snowflake/use-case-routing.ts`   | Ordnet fachliche Snowflake-Use-Cases einem Instanzprofil und einer Tabelle zu.                                                         |
 | `_shared/snowflake/meta.ts`               | Erzeugt standardisierte Metadaten für Snowflake-Antworten.                                                                             |
 | `_shared/utils/env.ts`                    | Liest optionale oder verpflichtende Umgebungsvariablen und bricht bei Fehlkonfiguration früh ab.                                       |
+| `_shared/utils/sendgrid.ts`               | Gemeinsamer SendGrid-Versand: Branding/Template-IDs aus `customer_labels`, Dynamic-Template-Aufruf.                                    |
+| `_shared/utils/salesforceSync.ts`         | Nach jedem Kunden-Mailversand: GCID + Mailtyp an Make/Celonis/Salesforce. Ohne GCID oder Secrets kein Call; Fehler blocken den Versand nie. |
 
 
 ### Architekturprinzip
@@ -190,7 +194,7 @@ Diese Trigger sollten nicht als KDA-Fachlogik verändert oder entfernt werden.
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `Get_Trigger_Data`                | Liest aktivierte Trigger-Konfigurationen, ruft konfigurierte Snowflake-Views ab, normalisiert Datumswerte, priorisiert Kandidaten und bereinigt alte Backlog-Einträge. | Snowflake Views, `Trigger_Config`, `Trigger_Backlog`                    |
 | `Select_KDA_Process_From_Trigger` | Bewertet offene Trigger-Kandidaten anhand von Vorlaufzeiten, Lockout-Perioden, vorhandenen True Values und bereits laufenden Prozessen.                                | `Trigger_Backlog`, `Trigger_Config`, `Process_Database`, `Customer_PII` |
-| `insert_new_process`              | Erstellt für akzeptierte Kandidaten PII- und Prozessdatensätze, lädt operative Daten und PII aus Snowflake und verhindert Doppelanlagen.                               | Snowflake, `Trigger_Backlog`, `Customer_PII`, `Process_Database`        |
+| `insert_new_process`              | Erstellt für akzeptierte Kandidaten PII- und Prozessdatensätze, lädt operative Daten und PII (inkl. GCID) aus Snowflake und verhindert Doppelanlagen.                  | Snowflake, `Trigger_Backlog`, `Customer_PII`, `Process_Database`        |
 
 
 ### Kundenkommunikation und Portalzugriff
@@ -198,11 +202,11 @@ Diese Trigger sollten nicht als KDA-Fachlogik verändert oder entfernt werden.
 
 | Function              | Verantwortung                                                                                                                                          | Wichtige Datenquellen/-ziele                                                                         |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `send-portal-link`    | Erzeugt einen Magic Link, speichert Hash und verschlüsselten Token und versendet die erste E-Mail über SendGrid.                                       | `Process_Database`, `Customer_PII`, `customer_labels`, `Trigger_Config`, `access_tokens`, SendGrid   |
+| `send-portal-link`    | Erzeugt einen Magic Link, speichert Hash und verschlüsselten Token, versendet die erste E-Mail über SendGrid und meldet GCID/Mailtyp an Salesforce.    | `Process_Database`, `Customer_PII`, `customer_labels`, `Trigger_Config`, `access_tokens`, SendGrid, Make/Celonis |
 | `open_process`        | Validiert Prozess-ID, Token, Ablaufdatum und Kunden-PLZ und liefert die für das Portal benötigten Prozessdaten.                                        | `access_tokens`, `Process_Database`, `Customer_PII`, `Trigger_Config`                                |
 | `create_upload_url`   | Validiert Token und PLZ und erstellt eine signierte Upload-URL für Zählerbilder im privaten Storage-Bucket.                                            | `access_tokens`, `Process_Database`, Supabase Storage                                                |
-| `submit_process`      | Speichert Zählerstände und Bildreferenzen (`upsert` auf `submission_files`), setzt den Prozess auf Status `4`, entwertet den Token und versendet eine Bestätigung. | `Process_Database`, `Customer_PII`, `customer_labels`, `submission_files`, `access_tokens`, SendGrid |
-| `send-kda-reminders`  | Versendet zeitgesteuerte Reminder; überspringt Prozesse mit noch gültigem CS-Override; verwendet nur Tokens mit `encrypted_token`. Nach Fristablauf Status `50`. | `Process_Database`, `Trigger_Config`, `Customer_PII`, `customer_labels`, `access_tokens`, SendGrid   |
+| `submit_process`      | Speichert Zählerstände und Bildreferenzen (`upsert` auf `submission_files`), setzt den Prozess auf Status `4`, entwertet den Token, versendet eine Bestätigung und meldet GCID an Salesforce. | `Process_Database`, `Customer_PII`, `customer_labels`, `submission_files`, `access_tokens`, SendGrid, Make/Celonis |
+| `send-kda-reminders`  | Versendet zeitgesteuerte Reminder; überspringt Prozesse mit noch gültigem CS-Override; verwendet nur Tokens mit `encrypted_token`. Nach Fristablauf Status `50`. Meldet GCID/Mailtyp an Salesforce. | `Process_Database`, `Trigger_Config`, `Customer_PII`, `customer_labels`, `access_tokens`, SendGrid, Make/Celonis |
 | `handle-email-events` | Verarbeitet SendGrid-Events für das KDA-System und setzt offene Prozesse bei `bounce` oder `dropped` auf Status `404`.                                 | SendGrid Event Webhook, `Process_Database`, `Customer_PII`                                           |
 
 
@@ -288,7 +292,8 @@ send-portal-link
         ├─ erzeugt kryptografisch sicheren Token
         ├─ speichert SHA-256-Hash
         ├─ speichert AES-GCM-verschlüsselten Token
-        └─ versendet SendGrid-E-Mail mit Magic Link
+        ├─ versendet SendGrid-E-Mail mit Magic Link
+        └─ Salesforce-Sync (GCID, nur wenn customer_gcid gesetzt)
                 │
                 ▼
          Kundenportal / Frontend
@@ -304,7 +309,8 @@ send-portal-link
                      ├─ verknüpft Belegbilder
                      ├─ setzt kda_status = 4
                      ├─ entwertet den Token
-                     └─ versendet Bestätigung
+                     ├─ versendet Bestätigung
+                     └─ Salesforce-Sync (GCID, nur wenn customer_gcid gesetzt)
 ```
 
 Für Bild-Uploads werden ausschließlich die OBIS-Codes `1.8.0` und `2.8.0` akzeptiert. Die Dateien liegen laut Code im privaten Supabase-Storage-Bucket `meter-readings_pics` unter einem prozessbezogenen Pfad.
@@ -431,6 +437,7 @@ Die folgenden Statuswerte sind in den bereitgestellten Functions und im Teams-Re
 | Data Warehouse    | Snowflake SQL API                                                | Trigger-Quellen, PII-/Fachdaten, Plausibilitätsprüfung und Reporting-Sync |
 | Snowflake Auth    | RSA Key-Pair JWT / RS256                                         | Authentifizierung gegenüber der Snowflake SQL API                         |
 | E-Mail            | SendGrid Dynamic Templates                                       | Erstkontakt, Reminder, Eskalation und Bestätigung                         |
+| CRM-Sync          | Make/Celonis → Salesforce                                        | Nach Kunden-Mailversand: GCID + Mailtyp an Salesforce                     |
 | Messaging         | Microsoft Teams Webhooks                                         | Betriebsalarme und KDA-Dashboard                                          |
 | Workflow/Export   | Microsoft Power Automate                                         | Verarbeitung des wöchentlichen CSV-/Fall-Exports                          |
 | Kryptografie      | Web Crypto API, AES-256-GCM, SHA-256                             | Token-Verschlüsselung und sicherer Token-Vergleich                        |
@@ -506,6 +513,15 @@ $bytes = New-Object byte[] 32
 | `SENDGRID_API_KEY` | Für Mail-Functions | Versand von Portal-, Reminder- und Bestätigungsmails |
 | `SENDGRID_WEBHOOK_VERIFICATION_KEY` | Für `handle-email-events` | Öffentlicher Verification Key aus dem Signed Event Webhook in SendGrid |
 
+### Salesforce / Celonis-Sync
+
+
+| Variable | Pflicht | Verwendung |
+| --- | :---: | --- |
+| `SALESFORCE_SYNC_URL` | Für Mail-Functions (optional) | Make/Celonis-Szenario-Endpoint, der pro versendeter Mail die GCID an Salesforce meldet. Fehlt die Variable, wird der Sync stillschweigend übersprungen. |
+| `SALESFORCE_SYNC_TOKEN` | Wie oben | Wird als Header `Authorization: Token <token>` gesendet. |
+
+Die GCID stammt aus Snowflake `OPERATIONS_SANDBOX.KDA.GET_CUSTOMER_PII` und wird beim Prozessanlegen in `Customer_PII.customer_gcid` gespeichert. Der Sync feuert bei jeder Kunden-Mail (`send-portal-link`, `send-kda-reminders`, `submit_process`) mit `{ "data": { "GCID": "...", "text": "<Mail-Typ>[: reason_text bei erster Mail]" } }`. Ohne `customer_gcid` (Altfälle oder fehlende GCID in Snowflake) passiert nichts. Der Call ist nicht-blockierend: ein Fehler verhindert nie den Mailversand.
 
 Die Template-IDs sind aktuell direkt in den Functions hinterlegt. Änderungen an Branding oder Templates erfordern daher zurzeit eine Codeänderung und ein erneutes Deployment.
 
@@ -603,7 +619,7 @@ Nach dem Start zeigt die CLI unter anderem die lokale API-URL sowie Anon- und Se
 | `Trigger_Config`      | Fachliche Trigger-Konfiguration, Prioritäten, Vorlauf-/Lockout-Zeiten und Reminder-Intervalle |
 | `Trigger_Backlog`     | Kandidaten aus Snowflake einschließlich Auswahlstatus und Audit-Informationen                 |
 | `Process_Database`    | Zentraler Zustand jedes KDA-Prozesses; `submitted_via` markiert CS-Einreichungen              |
-| `Customer_PII`        | Personenbezogene Kunden- und Messstelleninformationen                                         |
+| `Customer_PII`        | Personenbezogene Kunden- und Messstelleninformationen inkl. optionaler `customer_gcid` (Salesforce) |
 | `customer_labels`     | Branding-, Absender- und Support-Konfiguration je Kundenlabel                                 |
 | `access_tokens`       | Token-Hash, optional verschlüsselter Token, Ablauf, `token_type`, `suspended_by_cs_at`, `issued_by`, `ticket_id` |
 | `kda_tab_permission`  | Welche internen Nutzer welchen Portal-Tab sehen (`user_id`, `tab`, `user_email`)              |

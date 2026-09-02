@@ -215,6 +215,7 @@ Deno.serve(async (req) => {
       let customerPlzRaw = getField(piiRow, ["customer_plz", "plz", "zip", "postcode", "zip_code"])
       const customerLabel = getField(piiRow, ["customer_label", "brand_key", "brand"])
       const meterNumberFromPii = getField(piiRow, ["meter_number", "zaehlernummer", "meter", "meter_no"])
+      const customerGcid = getField(piiRow, ["gcid", "customer_gcid"])
 
       if (
         meterNumberFromView &&
@@ -274,6 +275,7 @@ Deno.serve(async (req) => {
           melo,
           meter_number: meterNumberFromView,
           customer_plz: String(customerPlz),
+          global_customer_id: customerGcid,
         },
         p_process: {
           execution_date: exDate,

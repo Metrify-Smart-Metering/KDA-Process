@@ -204,6 +204,7 @@ export type MappedPii = {
   customerPlz: string | null
   customerLabel: string | null
   meterNumberFromPii: string | null
+  customerGcid: string | null
 }
 
 export function mapPii(piiRow: any): MappedPii {
@@ -217,6 +218,7 @@ export function mapPii(piiRow: any): MappedPii {
     customerPlz: normalizeGermanPlz(customerPlzRaw),
     customerLabel: getField(piiRow, ["customer_label", "brand_key", "brand"]),
     meterNumberFromPii: meterNumberOf(piiRow),
+    customerGcid: getField(piiRow, ["gcid", "customer_gcid"]),
   }
 }
 

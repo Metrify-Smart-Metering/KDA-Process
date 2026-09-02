@@ -124,6 +124,7 @@ Deno.serve(async (req) => {
         melo,
         meter_number: meterSnowflake,
         customer_plz: enrichment.pii.customerPlz,
+        global_customer_id: enrichment.pii.customerGcid,
       },
       p_process: {
         kda_status: 1,

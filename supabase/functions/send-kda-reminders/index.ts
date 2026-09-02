@@ -12,6 +12,7 @@ import {
   type CustomerLabelMailRow,
   type CustomerMailType,
 } from "../_shared/utils/sendgrid.ts"
+import { buildSalesforceSyncText, syncCustomerToSalesforce } from "../_shared/utils/salesforceSync.ts"
 
 const JOB_NAME = 'send-kda-reminders'
 // ==========================================
@@ -299,7 +300,7 @@ Deno.serve(async (req) => {
         // 4. Kundendaten (PII) laden
         const { data: piiData, error: piiError } = await supabase
           .from('Customer_PII')
-          .select('customer_mail, customer_f_name, customer_l_name, meter_number')
+          .select('customer_mail, customer_f_name, customer_l_name, meter_number, customer_gcid')
           .eq('id', piiId)
           .single()
 
@@ -384,6 +385,18 @@ Deno.serve(async (req) => {
             ...brandTemplateData(branding),
           },
         })
+
+        // 9.a Salesforce/Celonis-Sync (nicht-blockierend): darf den Ablauf nie kippen.
+        try {
+          const syncResult = await syncCustomerToSalesforce({
+            gcid: piiData.customer_gcid,
+            text: buildSalesforceSyncText(mailType),
+          })
+          console.log(`[SalesforceSync] Ergebnis für Prozess ${processId} (${mailType}): ${syncResult}`)
+        } catch (syncError) {
+          console.error(`[SalesforceSync] Fehlgeschlagen für Prozess ${processId}:`, syncError)
+          collector.warn(`Salesforce-Sync fehlgeschlagen (Mail wurde trotzdem versendet): ${syncError instanceof Error ? syncError.message : String(syncError)}`, { process_id: processId })
+        }
 
         // 9.b Bei der Schätzwert-Mail: Token endgültig entwerten.
         // Wird NACH erfolgreichem Mailversand ausgeführt, damit bei einem

@@ -11,6 +11,7 @@ import {
   sendDynamicTemplateMail,
   type CustomerLabelMailRow,
 } from "../_shared/utils/sendgrid.ts"
+import { buildSalesforceSyncText, syncCustomerToSalesforce } from "../_shared/utils/salesforceSync.ts"
 
 const JOB_NAME = 'send-portal-link'
 
@@ -93,7 +94,7 @@ Deno.serve(async (req) => {
     console.log(`[Load] Lade PII-Daten für ID: ${piiId}...`);
     const { data: piiData, error: piiError } = await supabase
       .from('Customer_PII')
-      .select('customer_mail, customer_f_name, customer_l_name, customer_salutation, meter_number')
+      .select('customer_mail, customer_f_name, customer_l_name, customer_salutation, meter_number, customer_gcid')
       .eq('id', piiId)
       .single();
 
@@ -278,6 +279,18 @@ Deno.serve(async (req) => {
         ...brandTemplateData(branding),
       },
     });
+
+    // 11. Salesforce/Celonis-Sync (nicht-blockierend): darf den Mailversand nie kippen.
+    try {
+      const syncResult = await syncCustomerToSalesforce({
+        gcid: piiData.customer_gcid,
+        text: buildSalesforceSyncText('first_mail', kdaReason),
+      });
+      console.log(`[SalesforceSync] Ergebnis für Prozess ${processId}: ${syncResult}`);
+    } catch (syncError) {
+      console.error(`[SalesforceSync] Fehlgeschlagen für Prozess ${processId}:`, syncError);
+      collector.warn(`Salesforce-Sync fehlgeschlagen (Mail wurde trotzdem versendet): ${syncError instanceof Error ? syncError.message : String(syncError)}`, { process_id: processId });
+    }
 
     // 12. Process_Database aktualisieren (mail_sent_at)
     const firstMailSentAt = new Date().toISOString();

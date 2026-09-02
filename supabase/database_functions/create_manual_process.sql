@@ -72,7 +72,8 @@ begin
     customer_salutation,
     melo,
     meter_number,
-    customer_plz
+    customer_plz,
+    customer_gcid
   )
   values (
     p_pii ->> 'customer_mail',
@@ -81,7 +82,8 @@ begin
     p_pii ->> 'customer_salutation',
     v_melo,
     p_pii ->> 'meter_number',
-    v_plz
+    v_plz,
+    nullif(btrim(p_pii ->> 'global_customer_id'), '')
   )
   returning id into v_pii_id;
 
