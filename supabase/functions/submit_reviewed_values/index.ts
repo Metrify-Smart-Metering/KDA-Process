@@ -97,11 +97,64 @@ Deno.serve(async (req) => {
         })
       }
 
-      updatePayload = {
-        cons_val: parsedCons,
-        prod_val: parsedProd,
-        kda_status: 100,
-        submitted_at: new Date().toISOString()
+      const { data: currentRow, error: currentError } = await supabase
+        .from('Process_Database')
+        .select('id, kda_status, manual_review_repeat')
+        .eq('id', process_id)
+        .maybeSingle()
+
+      if (currentError) {
+        console.error(`[DB-Fehler] Lookup fuer process_id ${process_id} fehlgeschlagen:`, currentError.message)
+        collector.error(`Lookup fuer process_id ${process_id} fehlgeschlagen: ${currentError.message}`, { process_id, action })
+        await logPipelineRun(supabaseAdmin, {
+          jobName: JOB_NAME,
+          status: 'error',
+          collector,
+          fatalErrorMessage: currentError.message
+        })
+        return new Response(JSON.stringify({ error: 'Interner Serverfehler beim Aktualisieren des Falls.' }), {
+          status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        })
+      }
+
+      if (!currentRow || currentRow.kda_status !== 9) {
+        const reason = !currentRow
+          ? `process_id ${process_id} existiert nicht oder ist fuer diesen Nutzer nicht sichtbar (RLS).`
+          : `process_id ${process_id} hat kda_status=${currentRow.kda_status} statt 9. Vermutlich bereits bearbeitet.`
+        const clientMessage = !currentRow
+          ? 'Fall wurde nicht gefunden.'
+          : 'Dieser Fall wurde bereits bearbeitet.'
+        console.warn(`[Update-Konflikt] ${reason}`)
+        collector.warn(reason, { process_id, action })
+        await logPipelineRun(supabaseAdmin, {
+          jobName: JOB_NAME,
+          status: 'success',
+          collector,
+          durationMs: Date.now() - startTime
+        })
+        return new Response(JSON.stringify({ error: clientMessage }), {
+          status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        })
+      }
+
+      // Zweites Accept (Flag schon gesetzt, Fall war 9→4→9): endgueltig → 100.
+      // Erstes Accept: nur Werte + Status 4. Der DB-Trigger
+      // trigger_evaluate_plausibility feuert genau beim Wechsel auf 4
+      // (old.kda_status is distinct from 4). Die Flag setzt evaluate-plausibility
+      // erst, wenn die Re-Pruefung unplausibel wieder auf 9 geht.
+      if (currentRow.manual_review_repeat) {
+        updatePayload = {
+          cons_val: parsedCons,
+          prod_val: parsedProd,
+          kda_status: 100,
+          submitted_at: new Date().toISOString()
+        }
+      } else {
+        updatePayload = {
+          cons_val: parsedCons,
+          prod_val: parsedProd,
+          kda_status: 4,
+        }
       }
     } else if (action === 'dismiss') {
       // Manuell geschlossen: verlaesst die Review-Queue ohne Schaetzung,

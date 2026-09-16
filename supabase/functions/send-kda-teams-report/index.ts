@@ -40,6 +40,7 @@ const STATUS_META: Record<number, { label: string; dot: string }> = {
   50: { label: "Estimated Value", dot: "📊" },
   100: { label: "Value Accepted", dot: "✅" },
   404: { label: "Email is not able to be sent", dot: "❌" },
+  405: { label: "Zähler nicht mehr vorhanden", dot: "🔁" },
   999: { label: "Manually dismissed", dot: "🚫" },
   1000: { label: "Mass Upload File", dot: "📁" }
 };
@@ -539,7 +540,7 @@ console.log(`[Info] Systemgesundheit (7 Tage): ${fatalAborts} Abbrüche, ${total
       statusCountsTotal[status] = (statusCountsTotal[status] || 0) + 1;
     }
 
-    const totalAnswered = allProcesses.filter(p => p.submitted_at !== null || (p.kda_status >= 4 && p.kda_status !== 404)).length;
+    const totalAnswered = allProcesses.filter(p => p.submitted_at !== null || (p.kda_status >= 4 && p.kda_status !== 404 && p.kda_status !== 405)).length;
     const totalAnswerRate = openedProcsTotal > 0 ? Math.round((totalAnswered / openedProcsTotal) * 100) : 0;
 
     // ==========================================

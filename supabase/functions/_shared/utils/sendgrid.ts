@@ -141,6 +141,29 @@ export function brandTemplateData(branding: ResolvedMailBranding): Record<string
   }
 }
 
+export type SendgridAttachment = {
+  content: string
+  type: string
+  filename: string
+  disposition?: 'attachment' | 'inline'
+}
+
+async function postSendgridMail(apiKey: string, payload: Record<string, unknown>): Promise<void> {
+  const sendgridResponse = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  })
+
+  if (!sendgridResponse.ok) {
+    const errorBody = await sendgridResponse.text()
+    throw new Error(`SendGrid API meldet Fehler-Code ${sendgridResponse.status}: ${errorBody}`)
+  }
+}
+
 export async function sendDynamicTemplateMail(params: {
   apiKey: string
   to: string
@@ -150,37 +173,82 @@ export async function sendDynamicTemplateMail(params: {
   subject: string
   dynamicTemplateData: Record<string, unknown>
 }): Promise<void> {
-  const sendgridResponse = await fetch('https://api.sendgrid.com/v3/mail/send', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${params.apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      personalizations: [
-        {
-          to: [{ email: params.to }],
-          custom_args: {
-            kda_source: 'kda-system',
-          },
-          dynamic_template_data: params.dynamicTemplateData,
+  await postSendgridMail(params.apiKey, {
+    personalizations: [
+      {
+        to: [{ email: params.to }],
+        custom_args: {
+          kda_source: 'kda-system',
         },
-      ],
-      from: {
-        email: params.fromEmail,
-        name: params.fromName,
+        dynamic_template_data: params.dynamicTemplateData,
       },
-      subject: params.subject,
-      template_id: params.templateId,
-      mail_settings: SENDGRID_MAIL_SETTINGS,
-      tracking_settings: SENDGRID_TRACKING_SETTINGS,
-    }),
+    ],
+    from: {
+      email: params.fromEmail,
+      name: params.fromName,
+    },
+    subject: params.subject,
+    template_id: params.templateId,
+    mail_settings: SENDGRID_MAIL_SETTINGS,
+    tracking_settings: SENDGRID_TRACKING_SETTINGS,
   })
+}
 
-  if (!sendgridResponse.ok) {
-    const errorBody = await sendgridResponse.text()
-    throw new Error(`SendGrid API meldet Fehler-Code ${sendgridResponse.status}: ${errorBody}`)
+/**
+ * Roh-HTML an den Kundenservice, ohne Dynamic Template.
+ * custom_args.kda_source weicht bewusst von kda-system ab, damit ein Bounce
+ * an die Support-Adresse nicht den Kundenprozess auf 404 setzt.
+ */
+export async function sendHtmlMailWithAttachments(params: {
+  apiKey: string
+  to: string
+  fromEmail: string
+  fromName: string
+  subject: string
+  html: string
+  replyTo?: string | null
+  attachments?: SendgridAttachment[]
+  customArgs?: Record<string, string>
+}): Promise<void> {
+  const payload: Record<string, unknown> = {
+    personalizations: [
+      {
+        to: [{ email: params.to }],
+        custom_args: {
+          kda_source: 'kda-meter-missing',
+          ...(params.customArgs ?? {}),
+        },
+      },
+    ],
+    from: {
+      email: params.fromEmail,
+      name: params.fromName,
+    },
+    subject: params.subject,
+    content: [
+      {
+        type: 'text/html',
+        value: params.html,
+      },
+    ],
+    mail_settings: SENDGRID_MAIL_SETTINGS,
+    tracking_settings: SENDGRID_TRACKING_SETTINGS,
   }
+
+  if (params.replyTo) {
+    payload.reply_to = { email: params.replyTo }
+  }
+
+  if (params.attachments && params.attachments.length > 0) {
+    payload.attachments = params.attachments.map((attachment) => ({
+      content: attachment.content,
+      type: attachment.type,
+      filename: attachment.filename,
+      disposition: attachment.disposition ?? 'attachment',
+    }))
+  }
+
+  await postSendgridMail(params.apiKey, payload)
 }
 
 function requireCssColor(value: string | null, field: string, customerLabel: string): string {

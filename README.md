@@ -53,6 +53,7 @@ KDA-Process/
         ├── handle-email-events/
         ├── insert_new_process/
         ├── open_process/
+        ├── report_meter_missing/
         ├── Select_KDA_Process_From_Trigger/
         ├── send-kda-reminders/
         ├── send-kda-teams-report/
@@ -81,7 +82,7 @@ KDA-Process/
 | `_shared/snowflake/use-case-routing.ts`   | Ordnet fachliche Snowflake-Use-Cases einem Instanzprofil und einer Tabelle zu.                                                         |
 | `_shared/snowflake/meta.ts`               | Erzeugt standardisierte Metadaten für Snowflake-Antworten.                                                                             |
 | `_shared/utils/env.ts`                    | Liest optionale oder verpflichtende Umgebungsvariablen und bricht bei Fehlkonfiguration früh ab.                                       |
-| `_shared/utils/sendgrid.ts`               | Gemeinsamer SendGrid-Versand: Branding/Template-IDs aus `customer_labels`, Dynamic-Template-Aufruf.                                    |
+| `_shared/utils/sendgrid.ts`               | Gemeinsamer SendGrid-Versand: Branding/Template-IDs aus `customer_labels`, Dynamic-Template-Aufruf, HTML-Mail mit Anhängen an den Kundenservice. |
 | `_shared/utils/salesforceSync.ts`         | Nach jedem Kunden-Mailversand: GCID + Mailtyp an Make/Celonis/Salesforce. Ohne GCID oder Secrets kein Call; Fehler blocken den Versand nie. |
 
 
@@ -206,6 +207,7 @@ Diese Trigger sollten nicht als KDA-Fachlogik verändert oder entfernt werden.
 | `open_process`        | Validiert Prozess-ID, Token, Ablaufdatum und Kunden-PLZ und liefert die für das Portal benötigten Prozessdaten.                                        | `access_tokens`, `Process_Database`, `Customer_PII`, `Trigger_Config`                                |
 | `create_upload_url`   | Validiert Token und PLZ und erstellt eine signierte Upload-URL für Zählerbilder im privaten Storage-Bucket.                                            | `access_tokens`, `Process_Database`, Supabase Storage                                                |
 | `submit_process`      | Speichert Zählerstände und Bildreferenzen (`upsert` auf `submission_files`), setzt den Prozess auf Status `4`, entwertet den Token, versendet eine Bestätigung und meldet GCID an Salesforce. | `Process_Database`, `Customer_PII`, `customer_labels`, `submission_files`, `access_tokens`, SendGrid, Make/Celonis |
+| `report_meter_missing` | Nimmt die Portal-Meldung „Zähler nicht mehr vorhanden“ entgegen (neue Zählernummer, optionale Tauschangaben, zwei Fotos als Base64), mailt den Kundenservice ohne SendGrid-Template inkl. Anhängen, setzt Status `405` und entwertet Tokens. | `access_tokens`, `Process_Database`, `Customer_PII`, `customer_labels`, SendGrid |
 | `send-kda-reminders`  | Versendet zeitgesteuerte Reminder; überspringt Prozesse mit noch gültigem CS-Override; verwendet nur Tokens mit `encrypted_token`. Nach Fristablauf Status `50`. Meldet GCID/Mailtyp an Salesforce. | `Process_Database`, `Trigger_Config`, `Customer_PII`, `customer_labels`, `access_tokens`, SendGrid, Make/Celonis |
 | `handle-email-events` | Verarbeitet SendGrid-Events für das KDA-System und setzt offene Prozesse bei `bounce` oder `dropped` auf Status `404`.                                 | SendGrid Event Webhook, `Process_Database`, `Customer_PII`                                           |
 
@@ -216,7 +218,7 @@ Diese Trigger sollten nicht als KDA-Fachlogik verändert oder entfernt werden.
 | Function                 | Verantwortung                                                                                                                                                             | Wichtige Datenquellen/-ziele                                      |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `evaluate-plausibility`  | Reagiert auf eingereichte Werte, ruft die Snowflake-Plausibilitätsprüfung auf und entscheidet zwischen akzeptiert, manuellem Review, Schätzung oder Wiederholungsprozess. | `Process_Database`, `Customer_PII`, `submission_files`, Snowflake |
-| `submit_reviewed_values` | Ermöglicht authentifizierten internen Nutzern, einen Fall im Status `9` zu akzeptieren (`100`), zu schätzen (`50`), einen Folgeprozess anzulegen oder zu dismissen (`999`). Dismiss läuft über service_role. | Supabase Auth, RLS, `Process_Database` |
+| `submit_reviewed_values` | Ermöglicht authentifizierten internen Nutzern, einen Fall im Status `9` zu akzeptieren (erstes Accept → Status `4` und Re-Plausibilisierung, zweites Accept bei `manual_review_repeat` → `100`), zu schätzen (`50`), einen Folgeprozess anzulegen oder zu dismissen (`999`). Dismiss läuft über service_role. | Supabase Auth, RLS, `Process_Database` |
 | `manual_process_preview` | Zeigt authentifizierten internen Nutzern Snowflake-Daten zu einer Melo, inkl. Zählernummer-Abgleich. Legt nichts an. | Supabase Auth, `Trigger_Config`, Snowflake |
 | `manual_process_create`  | Legt für eine Melo einen Prozess mit Trigger-Typ `manual_kda` an und löst den Portal-Link-Versand aus. | Supabase Auth, Snowflake, `create_manual_process`, `Customer_PII`, `Process_Database` |
 
@@ -304,16 +306,45 @@ send-portal-link
                 ├─ create_upload_url
                 │    └─ liefert signierte Storage-Upload-URL
                 │
-                └─ submit_process
-                     ├─ speichert Zählerstände
-                     ├─ verknüpft Belegbilder
-                     ├─ setzt kda_status = 4
-                     ├─ entwertet den Token
-                     ├─ versendet Bestätigung
-                     └─ Salesforce-Sync (GCID, nur wenn customer_gcid gesetzt)
+                ├─ submit_process
+                │    ├─ speichert Zählerstände
+                │    ├─ verknüpft Belegbilder
+                │    ├─ setzt kda_status = 4
+                │    ├─ entwertet den Token
+                │    ├─ versendet Bestätigung
+                │    └─ Salesforce-Sync (GCID, nur wenn customer_gcid gesetzt)
+                │
+                └─ report_meter_missing
+                     ├─ Formular + 2 Fotos (Base64, kein Storage-Bucket)
+                     ├─ HTML-Mail an kundenservice@metrify.de mit Anhängen
+                     ├─ setzt kda_status = 405
+                     └─ entwertet alle offenen Tokens
 ```
 
-Für Bild-Uploads werden ausschließlich die OBIS-Codes `1.8.0` und `2.8.0` akzeptiert. Die Dateien liegen laut Code im privaten Supabase-Storage-Bucket `meter-readings_pics` unter einem prozessbezogenen Pfad.
+Für Bild-Uploads der Zählerstände werden ausschließlich die OBIS-Codes `1.8.0` und `2.8.0` akzeptiert. Die Dateien liegen laut Code im privaten Supabase-Storage-Bucket `meter-readings_pics` unter einem prozessbezogenen Pfad.
+
+`report_meter_missing` speichert keine Fotos im Storage: das Portal schickt JPEG/PNG/WebP als Base64 (max. 1,5 MB je Foto, clientseitig komprimieren) und die Function hängt sie an die Mail an `kundenservice@metrify.de`.
+
+#### Portal-Vertrag `report_meter_missing`
+
+Nach erfolgreichem `open_process`, auf der Zählerstands-Seite: Button „Zähler nicht mehr vorhanden“ öffnet ein kleines Formular. Nicht vor der PLZ-Prüfung zeigen.
+
+`POST /functions/v1/report_meter_missing` — gleiche Auth-Header wie `open_process` / `submit_process`.
+
+| Feld | Pflicht | Inhalt |
+| --- | --- | --- |
+| `process_id`, `token`, `customer_plz` | ja | dieselben Werte wie bei `open_process` |
+| `new_meter_number` | ja | neue Zählernummer, 1–64 Zeichen |
+| `cabinet_photo` | ja | Foto Zählerschrank |
+| `new_meter_photo` | ja | Foto neuer Zähler |
+| `meter_was_exchanged` | nein | `true`/`false` bzw. `"ja"`/`"nein"` |
+| `exchange_when` | nein | ungefähres Tauschdatum, max. 500 Zeichen |
+| `exchange_who` | nein | wer Ausbau veranlasst oder durchgeführt hat |
+| `meter_location` | nein | wo der alte Zähler jetzt ist |
+
+Foto-Objekt: `{ "filename": "schrank.jpg", "content_type": "image/jpeg", "content_base64": "..." }`. Erlaubt: JPEG, PNG, WebP. HEIC im Portal nach JPEG wandeln. Pro Foto max. 1,5 MB decodiert; auf ca. 800 KB JPEG komprimieren.
+
+Nach `200`: Bestätigungsseite, Zählerstands-Formular nicht mehr anbieten (Token ist verbraucht). `409` mit `code: METER_MISSING_ALREADY_REPORTED`: bereits gemeldet. `403` mit `LINK_USED` / `LINK_EXPIRED` / `INVALID_PLZ`: wie `open_process`.
 
 ### 2b. CS-Override (parallel zum Kundenlink)
 
@@ -359,8 +390,10 @@ evaluate-plausibility
         └─ unplausibel
              ├─ passende Bilder vorhanden ──→ Status 9 / manueller Review
              ├─ Wiederholung oder 60-Tage-Fall → Status 50 / Schätzung
-             └─ sonst ───────────────────────→ Status 9 + Folgeprozess in 7 Tagen
+             └─ sonst ───────────────────────→ Status 999 + Folgeprozess in 7 Tagen
 ```
+
+Erstes Accept aus Status 9 geht zurück auf Status 4 (gleiche Prüfung über `trigger_evaluate_plausibility`, Nightly-Retry bei Snowflake-Fehlern). Bleibt der Fall unplausibel, landet er wieder auf 9 und erst dann mit `manual_review_repeat`. Zweites Accept geht direkt auf Status 100.
 
 Die Schwelle für die Implausibilitätsentscheidung ist im bereitgestellten Code zentral auf **33,4 %** festgelegt. Zusätzlich kann ein von Snowflake geliefertes `unrealistic_increase_flag` einen Wert als auffällig markieren.
 
@@ -412,11 +445,12 @@ Die folgenden Statuswerte sind in den bereitgestellten Functions und im Teams-Re
 | `2`    | Reminder versendet                                                         |
 | `3`    | Eskalationsmail versendet                                                  |
 | `4`    | Vorläufige Werte erfolgreich eingereicht; Plausibilitätsprüfung ausstehend |
-| `9`    | Unplausibler Wert beziehungsweise manueller Review erforderlich            |
+| `9`    | Unplausibler Wert beziehungsweise manueller Review erforderlich. `manual_review_repeat` wird gesetzt, wenn der Fall nach 9→4 unplausibel wieder auf 9 geht. |
 | `50`   | Ersatzwert/Schätzung                                                       |
 | `100`  | Wert akzeptiert                                                            |
 | `999`  | Fall dismissed (interner Review, nur Übergang von Status `9`)              |
 | `404`  | E-Mail konnte nicht zugestellt werden                                      |
+| `405`  | Zähler nicht mehr vorhanden (Kundenmeldung aus dem Portal)                 |
 | `1000` | Akzeptierter Wert wurde in den Massen-/Wochenexport übernommen             |
 
 
@@ -436,7 +470,7 @@ Die folgenden Statuswerte sind in den bereitgestellten Functions und im Teams-Re
 | Object Storage    | Supabase Storage                                                 | Private Speicherung von Zählerbildern                                     |
 | Data Warehouse    | Snowflake SQL API                                                | Trigger-Quellen, PII-/Fachdaten, Plausibilitätsprüfung und Reporting-Sync |
 | Snowflake Auth    | RSA Key-Pair JWT / RS256                                         | Authentifizierung gegenüber der Snowflake SQL API                         |
-| E-Mail            | SendGrid Dynamic Templates                                       | Erstkontakt, Reminder, Eskalation und Bestätigung                         |
+| E-Mail            | SendGrid Dynamic Templates + HTML mit Anhängen                   | Erstkontakt, Reminder, Eskalation, Bestätigung; CS-Mail bei fehlendem Zähler |
 | CRM-Sync          | Make/Celonis → Salesforce                                        | Nach Kunden-Mailversand: GCID + Mailtyp an Salesforce                     |
 | Messaging         | Microsoft Teams Webhooks                                         | Betriebsalarme und KDA-Dashboard                                          |
 | Workflow/Export   | Microsoft Power Automate                                         | Verarbeitung des wöchentlichen CSV-/Fall-Exports                          |

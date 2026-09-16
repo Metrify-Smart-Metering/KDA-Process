@@ -101,6 +101,9 @@ Deno.serve(async (req) => {
         trigger_id,
         last_cons_reading,
         last_prod_reading,
+        manual_review_repeat,
+        cons_plausibility_score,
+        prod_plausibility_score,
         Customer_PII (
           melo,
           meter_number
@@ -136,11 +139,25 @@ Deno.serve(async (req) => {
     console.log(`   - Ablesedatum: ${readingDate}`);
     console.log(`   - PII-ID: ${processData.customer_pii_id}`);
 
+    // Re-Prüfung nach Review-Accept: Trigger sendet old_record.kda_status = 9.
+    // Der Nightly-Cron faelscht old_record auf 3 — dann gelten vorhandene
+    // Scores aus der ersten Prüfung als Signal (Flag wird erst beim 4→9 gesetzt).
+    const isReEvalAfterReview =
+      Number(oldRecord?.kda_status) === 9 ||
+      processData.manual_review_repeat === true ||
+      processData.cons_plausibility_score != null ||
+      processData.prod_plausibility_score != null;
+
+    console.log(`   - Re-Prüfung nach Review-Accept: ${isReEvalAfterReview}`);
+
     if (!melo || !meterNumber) {
       console.warn("⚠️ [WARNUNG] MeLo oder Zählernummer fehlt. Abbruch der Prüfung. Setze kda_status auf 9 (Review).");
+      const missingMasterDataUpdate = isReEvalAfterReview
+        ? { kda_status: 9, manual_review_repeat: true }
+        : { kda_status: 9 };
       await supabase
         .from('Process_Database')
-        .update({ kda_status: 9 })
+        .update(missingMasterDataUpdate)
         .eq('id', record.id);
       return new Response("Prüfung abgebrochen wegen fehlender Stammdaten.", { status: 200 });
     }
@@ -257,6 +274,27 @@ Deno.serve(async (req) => {
       );
     }
 
+    // 4→9 nach Review-Accept: erst hier die Flag setzen (nicht schon beim 9→4).
+    // B2/B3/B4 (Schätzung / Wiederholung) dürfen diesen Fall nicht dismissen.
+    if (isReEvalAfterReview) {
+      console.log(`🔁 Re-Plausibilisierung nach Review weiterhin unplausibel → Status 9 + manual_review_repeat.`);
+      await supabase
+        .from('Process_Database')
+        .update({ kda_status: 9, manual_review_repeat: true })
+        .eq('id', record.id);
+      await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
+      return new Response(
+        JSON.stringify({
+          success: true,
+          status: 9,
+          branch: 'manual_review_repeat',
+          scores: { cons: consScore, prod: prodScore },
+          implausible: { cons: isConsImplausible, prod: isProdImplausible },
+        }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     // ============================================================
     // FALL B: UNPLAUSIBEL → erweiterte Logik
     // ============================================================
@@ -355,14 +393,13 @@ Deno.serve(async (req) => {
     // B4. Wiederholungs-Prozess erstellen
     console.log(`🆕 Erstelle Wiederholungs-Prozess für Melo ${melo}...`);
 
-    // Alter Prozess bleibt auf 9 (für Sichtbarkeit)
-    await supabase.from('Process_Database').update({ kda_status: 9 }).eq('id', record.id);
-
     // execution_date = heute + 7 Tage
     const today = new Date();
     const execDate = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
     const execDateIso = execDate.toISOString().split('T')[0];
 
+    // Erst die Wiederholung anlegen. Der Originalfall bleibt bis dahin auf 4,
+    // damit ein fehlgeschlagener Insert vom nächtlichen Status-4-Retry nachgeholt wird.
     const { data: newProc, error: insertErr } = await supabase
       .from('Process_Database')
       .insert({
@@ -384,10 +421,25 @@ Deno.serve(async (req) => {
 
     console.log(`✅ Wiederholungs-Prozess angelegt (ID: ${newProc.id}, Exec: ${execDateIso}).`);
 
+    // Originalfall ist durch die Wiederholung abgelöst: raus aus der Review-Queue,
+    // ohne Schätzung und ohne Massenupload.
+    const { data: dismissed, error: dismissErr } = await supabase
+      .from('Process_Database')
+      .update({ kda_status: 999 })
+      .eq('id', record.id)
+      .select('id');
+
+    if (dismissErr || !dismissed?.length) {
+      throw new Error(
+        `Wiederholungs-Prozess ${newProc.id} angelegt, aber Original ${record.id} konnte nicht auf 999 gesetzt werden: ${dismissErr?.message ?? 'keine Zeile getroffen'}`
+      );
+    }
+
+    await logPipelineRun(supabase, { jobName: JOB_NAME, status: 'success', collector, durationMs: Date.now() - startTime })
     return new Response(
       JSON.stringify({
         success: true,
-        status: 9,
+        status: 999,
         branch: 'repetition_created',
         old_process_id: record.id,
         new_process_id: newProc.id,
