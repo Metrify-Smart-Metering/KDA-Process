@@ -12,7 +12,7 @@ import {
   type CustomerLabelMailRow,
   type CustomerMailType,
 } from "../_shared/utils/sendgrid.ts"
-import { buildSalesforceSyncText, syncCustomerToSalesforce } from "../_shared/utils/salesforceSync.ts"
+import { syncCustomerToSalesforce } from "../_shared/utils/salesforceSync.ts"
 
 const JOB_NAME = 'send-kda-reminders'
 // ==========================================
@@ -369,6 +369,14 @@ Deno.serve(async (req) => {
             : `Information zur Schätzung Ihres Zählerstands für den Zähler ${meterNumber}`
 
         // 9. SendGrid E-Mail via Template API absenden
+        const dynamicTemplateData = {
+          customerName: customerName,
+          executionDateFormatted: executionDateFormatted,
+          meterNumber: meterNumber,
+          magicLink: magicLink,
+          linkValidityDays: linkValidityDays,
+          ...brandTemplateData(branding),
+        }
         await sendDynamicTemplateMail({
           apiKey: sendgridApiKey,
           to: recipientEmail,
@@ -376,21 +384,16 @@ Deno.serve(async (req) => {
           fromName: senderName,
           templateId,
           subject,
-          dynamicTemplateData: {
-            customerName: customerName,
-            executionDateFormatted: executionDateFormatted,
-            meterNumber: meterNumber,
-            magicLink: magicLink,
-            linkValidityDays: linkValidityDays,
-            ...brandTemplateData(branding),
-          },
+          dynamicTemplateData,
         })
 
         // 9.a Salesforce/Celonis-Sync (nicht-blockierend): darf den Ablauf nie kippen.
         try {
           const syncResult = await syncCustomerToSalesforce({
             gcid: piiData.customer_gcid,
-            text: buildSalesforceSyncText(mailType),
+            templateId,
+            variables: dynamicTemplateData,
+            processId,
           })
           console.log(`[SalesforceSync] Ergebnis für Prozess ${processId} (${mailType}): ${syncResult}`)
         } catch (syncError) {

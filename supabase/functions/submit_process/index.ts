@@ -9,7 +9,7 @@ import {
   sendDynamicTemplateMail,
   type CustomerLabelMailRow,
 } from "../_shared/utils/sendgrid.ts"
-import { buildSalesforceSyncText, syncCustomerToSalesforce } from "../_shared/utils/salesforceSync.ts"
+import { syncCustomerToSalesforce } from "../_shared/utils/salesforceSync.ts"
 
 const JOB_NAME = 'submit_process'
 
@@ -302,6 +302,13 @@ Deno.serve(async (req) => {
 
       if (sendgridApiKey && recipientEmail && meterNumber) {
         console.log(`[SendGrid] Sende Bestätigung an ${recipientEmail} mit Template ID '${templateId}'...`)
+        const dynamicTemplateData = {
+          customerName,
+          meterNumber,
+          consumptionValue: formatNumberDE(parsedConsVal),
+          productionValue: parsedProdVal !== null ? formatNumberDE(parsedProdVal) : null,
+          ...brandTemplateData(branding),
+        }
         await sendDynamicTemplateMail({
           apiKey: sendgridApiKey,
           to: recipientEmail,
@@ -309,19 +316,15 @@ Deno.serve(async (req) => {
           fromName: branding.senderName,
           templateId,
           subject: `Vielen Dank für Ihre Zählerstandsmeldung für den Zähler ${meterNumber}`,
-          dynamicTemplateData: {
-            customerName,
-            meterNumber,
-            consumptionValue: formatNumberDE(parsedConsVal),
-            productionValue: parsedProdVal !== null ? formatNumberDE(parsedProdVal) : null,
-            ...brandTemplateData(branding),
-          },
+          dynamicTemplateData,
         })
 
         try {
           const syncResult = await syncCustomerToSalesforce({
             gcid: piiData.customer_gcid,
-            text: buildSalesforceSyncText('submission_mail'),
+            templateId,
+            variables: dynamicTemplateData,
+            processId: process_id,
           })
           console.log(`[SalesforceSync] Ergebnis für Prozess ${process_id}: ${syncResult}`)
         } catch (syncError) {
